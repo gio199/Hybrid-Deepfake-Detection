@@ -1,24 +1,28 @@
 {
   "video": {
-    "source": "example2\\example2.mp4",
+    "source": "example2/example2.mp4",
     "is_webcam": false,
     "fps": 30.0,
     "width": 1920,
     "height": 1080,
     "frames_processed": 238,
     "duration_sec": 7.93,
-    "processing_time_sec": 14.78,
-    "file_size_bytes": 16072281
+    "processing_time_sec": 42.24,
+    "file_size_bytes": 16072281,
+    "max_people": 1,
+    "object_detection_enabled": true
   },
   "result": {
-    "final_score": 58.6,
+    "final_score": 56.5,
     "verdict": "LIKELY FAKE",
     "frames_evaluated": 192,
     "frames_total": 238,
     "peak_window_score": 83.3,
     "peak_window_timestamp_sec": 5.6,
     "global_quality_score": 79.1,
-    "global_quality_reason": "Video was encoded with a generous bitrate (0.261 bits/pixel) yet the face stays soft throughout the clip (median sharpness=77) - real camera footage encoded this generously would normally retain fine detail"
+    "global_quality_reason": "Video was encoded with a generous bitrate (0.261 bits/pixel) yet the face stays soft throughout the clip (median sharpness=77) - real camera footage encoded this generously would normally retain fine detail",
+    "max_people_detected": 1,
+    "people_track_count": 5
   },
   "category_breakdown": {
     "blur_mismatch": {
@@ -32,9 +36,9 @@
       "frame_frac": 0.13020833333333334
     },
     "bone_length": {
-      "mean": 0.13279774251236778,
+      "mean": 0.11196440917903445,
       "peak": 1.0,
-      "frame_frac": 0.171875
+      "frame_frac": 0.15104166666666666
     },
     "detection_flicker": {
       "mean": 0.0,
@@ -52,19 +56,34 @@
       "frame_frac": 0.015625
     },
     "joint_angle_motion": {
-      "mean": 0.010416666666666666,
+      "mean": 0.005208333333333333,
       "peak": 1.0,
-      "frame_frac": 0.010416666666666666
+      "frame_frac": 0.005208333333333333
     },
     "landmark_jitter": {
-      "mean": 0.07032691668709597,
-      "peak": 1.0,
-      "frame_frac": 0.5
+      "mean": 0.04949358335376263,
+      "peak": 0.2546111620162161,
+      "frame_frac": 0.4791666666666667
     },
     "landmark_jump": {
-      "mean": 0.07174225150290149,
+      "mean": 0.06653391816956816,
       "peak": 1.0,
-      "frame_frac": 0.13020833333333334
+      "frame_frac": 0.125
+    },
+    "object_flicker": {
+      "mean": 0.20963541666666666,
+      "peak": 1.0,
+      "frame_frac": 0.4010416666666667
+    },
+    "object_size_jump": {
+      "mean": 0.012746611292979118,
+      "peak": 1.0,
+      "frame_frac": 0.03125
+    },
+    "object_teleport": {
+      "mean": 0.0,
+      "peak": 0.0,
+      "frame_frac": 0.0
     },
     "pixel_flicker": {
       "mean": 0.006872463899955997,
@@ -84,7 +103,9 @@
       "peak_score": 1.0,
       "categories": [
         "bone_length",
-        "landmark_jump"
+        "landmark_jump",
+        "object_flicker",
+        "object_size_jump"
       ]
     },
     {
@@ -92,7 +113,8 @@
       "end_frame": 48,
       "peak_score": 0.551,
       "categories": [
-        "landmark_jump"
+        "landmark_jump",
+        "object_flicker"
       ]
     },
     {
@@ -137,6 +159,7 @@
         "bone_length",
         "landmark_jitter",
         "landmark_jump",
+        "object_flicker",
         "pixel_flicker"
       ]
     },
@@ -148,6 +171,7 @@
         "blur_onset_spike",
         "bone_length",
         "landmark_jitter",
+        "object_flicker",
         "symmetry_break"
       ]
     },
@@ -180,19 +204,9 @@
         "joint_angle_motion",
         "landmark_jitter",
         "landmark_jump",
+        "object_flicker",
         "pixel_flicker",
         "symmetry_break"
-      ]
-    },
-    {
-      "start_frame": 188,
-      "end_frame": 191,
-      "peak_score": 1.0,
-      "categories": [
-        "bone_length",
-        "joint_angle_motion",
-        "landmark_jitter",
-        "landmark_jump"
       ]
     }
   ],
@@ -866,10 +880,10 @@
       1.0,
       1.0,
       0.0,
-      1.0,
-      1.0,
-      1.0,
-      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
       0.0,
       0.0,
       0.0,

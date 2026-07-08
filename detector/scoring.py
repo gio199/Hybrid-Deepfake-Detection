@@ -45,6 +45,24 @@ from .history import Signal
 # the test set - a 0% true-positive rate. Left computed (visible in the
 # JSON `category_breakdown`) for informational/manual-review purposes
 # only.
+#
+# Note on `object_flicker` / `object_size_jump` / `object_teleport`
+# (weighted to 0.0, i.e. computed but excluded from the score - see
+# object_checks.py): the idea was sound (generative video can make
+# background/foreground objects morph, flicker, or drift implausibly,
+# same as it does to faces/bodies), but validating against this project's
+# test clips showed EfficientDet-Lite0 is simply too unreliable at this
+# task on ordinary talking-head footage - it flickered a misclassified
+# "tv" on/off in the *real* baseline clip's background 6x in a 15-frame
+# window (score 0.75) and its bounding box jumped so hard between frames
+# it saturated the z-score check (z>30), while on a *confirmed-fake* clip
+# it just as readily flickered a person's head between "umbrella" and
+# nothing 10x in a window (score 1.0) - i.e. the noise floor from the
+# detector's own class-confusion and box instability is at least as large
+# on real footage as on fake footage, so it has no discriminative power in
+# practice. Left computed (visible in the JSON `category_breakdown` and
+# drawn in the annotated video) for informational/manual-review purposes
+# only, exactly like `hand_blur_anomaly`.
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "landmark_jitter": 0.6,
     "landmark_jump": 1.0,
@@ -57,7 +75,27 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "blur_mismatch": 1.1,
     "hand_blur_anomaly": 0.0,
     "blur_onset_spike": 0.9,
+    "object_flicker": 0.0,
+    "object_size_jump": 0.0,
+    "object_teleport": 0.0,
 }
+
+
+def combine_signals(signals: List[Signal], weights: Dict[str, float]) -> float:
+    """Weighted noisy-OR combination of independent anomaly signals into a
+    single [0, 1] score: individually-weak evidence compounds towards a
+    high combined score, while one strong, highly-weighted signal (e.g. a
+    severe head-pose reprojection failure) can push the score high on its
+    own. Shared by `AnomalyAggregator` (per-frame scoring) and `main.py`
+    (ranking which tracked person is "worst" in a multi-person frame) so
+    both always agree on how signals combine.
+    """
+    survival = 1.0
+    for s in signals:
+        weight = weights.get(s.name, 1.0)
+        contribution = _clip01(weight * s.score)
+        survival *= (1.0 - contribution)
+    return _clip01(1.0 - survival)
 
 DEFAULT_FRAME_FLAG_THRESHOLD = 0.4
 
@@ -111,6 +149,8 @@ class FrameScore:
     category_scores: Dict[str, float] = field(default_factory=dict)
     reasons: List[str] = field(default_factory=list)
     evaluated: bool = True
+    worst_person_id: Optional[int] = None
+    people_present: int = 0
 
 
 @dataclass
@@ -134,6 +174,8 @@ class VideoResult:
     peak_window_timestamp_sec: float = 0.0
     global_quality_score: float = 0.0
     global_quality_reason: str = ""
+    max_people_detected: int = 0
+    people_track_count: int = 0
 
 
 class AnomalyAggregator:
@@ -148,10 +190,11 @@ class AnomalyAggregator:
         self._frame_scores: List[FrameScore] = []
 
     def add_frame(self, frame_idx: int, timestamp_sec: float, signals: List[Signal],
-                  evaluated: bool) -> FrameScore:
+                  evaluated: bool, worst_person_id: Optional[int] = None,
+                  people_present: int = 0) -> FrameScore:
         category_scores = {s.name: s.score for s in signals}
         reasons = [s.reason for s in signals if s.score > 0.05]
-        combined = self._noisy_or(signals) if evaluated else 0.0
+        combined = combine_signals(signals, self.weights) if evaluated else 0.0
 
         fs = FrameScore(
             frame_idx=frame_idx,
@@ -160,19 +203,14 @@ class AnomalyAggregator:
             category_scores=category_scores,
             reasons=reasons,
             evaluated=evaluated,
+            worst_person_id=worst_person_id,
+            people_present=people_present,
         )
         self._frame_scores.append(fs)
         return fs
 
-    def _noisy_or(self, signals: List[Signal]) -> float:
-        survival = 1.0
-        for s in signals:
-            weight = self.weights.get(s.name, 1.0)
-            contribution = _clip01(weight * s.score)
-            survival *= (1.0 - contribution)
-        return _clip01(1.0 - survival)
-
-    def finalize(self, global_signals: Optional[List[Signal]] = None) -> VideoResult:
+    def finalize(self, global_signals: Optional[List[Signal]] = None,
+                 max_people_detected: int = 0, people_track_count: int = 0) -> VideoResult:
         evaluated_scores = [fs for fs in self._frame_scores if fs.evaluated]
         global_score, global_reason = self._worst_global_signal(global_signals)
 
@@ -185,6 +223,8 @@ class AnomalyAggregator:
                 frame_scores=self._frame_scores,
                 frames_evaluated=0,
                 frames_total=len(self._frame_scores),
+                max_people_detected=max_people_detected,
+                people_track_count=people_track_count,
             )
 
         scores = [fs.combined_score for fs in evaluated_scores]
@@ -210,6 +250,8 @@ class AnomalyAggregator:
             peak_window_timestamp_sec=peak_ts,
             global_quality_score=global_score,
             global_quality_reason=global_reason,
+            max_people_detected=max_people_detected,
+            people_track_count=people_track_count,
         )
 
     @staticmethod

@@ -43,6 +43,8 @@ def build_report_dict(result: VideoResult, video_meta: Dict) -> Dict:
             "peak_window_timestamp_sec": round(result.peak_window_timestamp_sec, 2),
             "global_quality_score": round(result.global_quality_score * 100.0, 1),
             "global_quality_reason": result.global_quality_reason,
+            "max_people_detected": result.max_people_detected,
+            "people_track_count": result.people_track_count,
         },
         "category_breakdown": result.category_breakdown,
         "flagged_ranges": [

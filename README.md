@@ -4,35 +4,43 @@ A **rule-based** (no training, no dataset required) command-line tool that:
 
 1. Tracks facial, body, and hand landmarks in a video file or webcam feed
    using [MediaPipe](https://developers.google.com/mediapipe) Face Mesh +
-   Pose + Hands.
-2. Watches the landmarks over time for **glitches** (jitter, sudden
+   Pose + Hands, optionally tracking **multiple people at once**, each
+   compared only against their own history.
+2. Detects and tracks **generic objects** (MediaPipe's EfficientDet-Lite0,
+   COCO classes) frame-to-frame, as a secondary evidence source.
+3. Watches the landmarks over time for **glitches** (jitter, sudden
    "teleporting" points, flickering detections, blending seams).
-3. Checks the landmark configuration against basic **human physics/anatomy**
+4. Checks the landmark configuration against basic **human physics/anatomy**
    (bone-length consistency, joint angle limits, head-pose reprojection
    error, left/right symmetry).
-4. Checks for **localized/selective blur** (face region blurrier than the
+5. Checks for **localized/selective blur** (face region blurrier than the
    rest of the scene, sudden sharpness drops) - a common trick used to
    visually hide generation artifacts.
-5. Checks whether the **whole video's face detail is implausibly soft
+6. Checks whether the **whole video's face detail is implausibly soft
    given how much data was spent encoding it** (bits-per-pixel vs. face
    sharpness) - real camera footage encoded at a generous bitrate should
    retain real fine detail; if it doesn't, that's a red flag that isn't
    explained away by ordinary compression.
-6. Combines all of these signals into a single **fake-likelihood score
+7. Combines all of these signals into a single **fake-likelihood score
    (0-100%)**, an annotated output video, a JSON report, and a PNG anomaly
    timeline chart.
 
 ## How it works (pipeline)
 
 ```
-Video/Webcam -> Frame capture -> MediaPipe FaceMesh+Pose
-             -> Landmark history buffer
+Video/Webcam -> Frame capture -> MediaPipe FaceMesh+Pose+Hands (multi-instance)
+                               -> Cross-model + cross-frame person tracking (person_tracker.py)
+             -> Frame capture -> MediaPipe EfficientDet-Lite0 object detection
+                               -> IoU-based object tracking (object_detection.py)
+             -> Per-person landmark history buffer (independent per tracked person)
              -> Glitch checks (jitter / jumps / flicker)
              -> Physics checks (bone length / joint angles / head-pose / symmetry)
              -> Blur checks (region blur mismatch / hand blur / blur-onset spike)
+             -> Object checks (flicker / size jump / teleport) - computed, not scored (see below)
+             -> Worst-scoring tracked person this frame drives the frame's signals
              -> Whole-video blur-vs-bitrate check (file size/length vs. face sharpness)
              -> Weighted aggregation -> final score + peak-burst diagnostic
-             -> Annotated video + JSON report + timeline chart
+             -> Annotated video (all people + objects) + JSON report + timeline chart
 ```
 
 ## Installation
@@ -44,13 +52,14 @@ pip install -r requirements.txt
 ```
 
 This uses MediaPipe's modern **Tasks API** (`FaceLandmarker` /
-`PoseLandmarker` / `HandLandmarker`), not the older `mediapipe.solutions`
-API (which was removed from the `mediapipe` package in version 0.10.30+).
-The first time you run the tool it will automatically download the three
-model bundles it needs (`face_landmarker.task`, `pose_landmarker_full.task`,
-`hand_landmarker.task`, a few MB each) into a local `models/` folder -
-this requires an internet connection once; after that everything runs
-fully offline.
+`PoseLandmarker` / `HandLandmarker` / `ObjectDetector`), not the older
+`mediapipe.solutions` API (which was removed from the `mediapipe` package
+in version 0.10.30+). The first time you run the tool it will
+automatically download the four model bundles it needs
+(`face_landmarker.task`, `pose_landmarker_full.task`,
+`hand_landmarker.task`, `efficientdet_lite0.tflite`, a few MB each) into a
+local `models/` folder - this requires an internet connection once; after
+that everything runs fully offline.
 
 ## Usage
 
@@ -77,6 +86,8 @@ Useful flags:
 | `--no-display` | Don't open a live preview window (video-file mode only writes to disk). |
 | `--history-window N` | Number of past frames kept for jitter/z-score baselines (default `30`). |
 | `--max-frames N` | Stop after N frames (useful for quick tests). |
+| `--max-people N` | Max number of people to detect/track at once (default `1`). Raising this enables multi-person tracking - see [Multi-person tracking](#multi-person-tracking) for an important trade-off before raising it. |
+| `--no-object-detection` | Disable object detection/tracking entirely (slightly faster; also removes it from the annotated video). |
 
 At the end of a run, the tool prints a summary like:
 
@@ -85,6 +96,7 @@ At the end of a run, the tool prints a summary like:
  Fake-likelihood score: 71.4 / 100
  Verdict: LIKELY FAKE
  Frames evaluated: 812 / 820
+ People tracked: max 1 at once, 1 distinct total
  Peak local anomaly burst: 96.0 / 100 (around t=11.9s)
  Whole-video blur-vs-bitrate check: 79.1 / 100
    Video was encoded with a generous bitrate (0.261 bits/pixel) yet the face stays soft...
@@ -103,14 +115,136 @@ videos or clips with a single bad cut.
 
 ## Output files
 
-- **Annotated video** (`--output`): original frames with the face mesh /
-  pose skeleton drawn, landmarks that triggered a rule highlighted in red,
-  and a running score overlay.
-- **JSON report** (`--report`): video metadata, final score, per-category
+- **Annotated video** (`--output`): original frames with each tracked
+  person's face mesh / pose skeleton / hands drawn in its own color and
+  labeled `P<id>`, landmarks that triggered a rule highlighted in red,
+  tracked objects boxed and labeled (red if an object-level signal fired
+  on them), and a running score overlay.
+- **JSON report** (`--report`): video metadata (including
+  `max_people_detected` / `people_track_count`), final score, per-category
   breakdown, list of flagged frame ranges with reasons, and (downsampled)
   per-frame raw scores.
 - **`<report>_timeline.png`**: a chart of the anomaly score over time,
   rendered next to the JSON report.
+
+## Multi-person tracking
+
+By default (`--max-people 1`) the tool tracks exactly one person, matching
+its original, well-calibrated single-person behavior. Passing
+`--max-people N` (N > 1) lets it track up to N people **simultaneously**,
+each with fully independent state (own `LandmarkHistory`, own
+`GlitchDetector`/`PhysicsChecker`/`BlurChecker`), so one person's motion or
+blur history never contaminates another's baseline. `detector/person_tracker.py`
+does this in two steps every frame:
+
+1. **Cross-model association** - MediaPipe's Face/Pose/Hand landmarkers each
+   return independent, uncorrelated lists of detections; faces are paired
+   with poses by nose-to-nose proximity (scaled by face size), and hands are
+   assigned to whichever person's wrist they're closest to. Unpaired
+   detections become face-only or pose-only "people".
+2. **Cross-frame identity** - a lightweight centroid tracker (nearest
+   anchor-point matching, no learned re-identification) keeps the same
+   `person_id` for a person across frames, tolerating up to 15 consecutive
+   missed frames before retiring an id.
+
+Each frame's contribution to the single overall video score is the
+**worst-scoring person present that frame** (via a `combine_signals` helper
+shared between per-person ranking and the final aggregator), so a video
+with one well-behaved person and one glitching person is still correctly
+flagged.
+
+**Why the default is 1, not higher (measured, not assumed):** enabling
+multi-instance detection changes MediaPipe's own behavior, not just how
+many results come back. Two effects were measured directly on this
+project's real test clip and both needed a fix or a documented trade-off:
+
+- **Duplicate "ghost" poses**: raising `num_poses` above 1 made
+  `PoseLandmarker` occasionally emit a spurious second/third pose for the
+  *same* physical person (same rough position, lower confidence, and a
+  nose-to-nose distance from the real pose consistently under ~22% of body
+  scale - measured directly, vs. a real second person who'd be at least a
+  full body-width away). Left unhandled, this fabricated phantom "people"
+  out of thin air (5 distinct tracked people were reported for a video
+  containing exactly one person). **Fixed**: `person_tracker.py` runs a
+  same-frame NMS pass (`_deduplicate_poses`/`_deduplicate_faces`) before
+  any association happens, suppressing a lower-confidence detection whose
+  anchor is too close to an already-kept one.
+- **Reduced per-instance temporal stability (not fully fixable)**: even
+  after removing the ghosts, the *real* tracked person's landmarks are
+  measurably jitterier in multi-instance mode. A direct side-by-side
+  measurement on the same clip (`PoseLandmarker` configured with
+  `num_poses=1` vs. `num_poses=4`, same frames, same person) showed mean
+  frame-to-frame nose displacement jump from **1.05px to 7.68px** (~7x) and
+  the 90th-percentile jump from 2.36px to 14.40px - i.e. `num_poses=1`
+  benefits from an internal single-instance tracking fast-path that
+  `num_poses>1` doesn't get, so it re-runs fuller detection more often.
+  This isn't something application code can fully undo, so it's disclosed
+  rather than hidden: raising `--max-people` trades some precision in the
+  landmark-jitter-family checks for multi-person coverage. Only raise it
+  when your footage actually has multiple people.
+
+**Real-world check - "only raise it when footage actually has multiple
+people" in practice:** all three example clips in this repo were assumed
+to contain multiple people and re-analyzed with `--max-people 4`. Visually
+inspecting sample frames from each showed only one of the three actually
+does:
+
+| Clip | What's really in frame | Max concurrent people found | Score: `--max-people 1` (default) | Score: `--max-people 4` |
+|---|---|---|---|---|
+| `example1` (news-compilation deepfake) | Several *different* single-subject news clips cut together (never two people at once) | 1 | 21.9 (LIKELY REAL) | 37.2 (SUSPICIOUS) - pure jitter-noise cost, no coverage gained |
+| `example2` (flood-reporter clip) | One subject, occasionally a tiny distant background figure | 2 | 56.5 (LIKELY FAKE) | 41.7 (SUSPICIOUS) - noise diluted a previously-clear signal |
+| `example3` (Veo3 street-walk video) | Genuinely 2-3 people walking together | 3 | 40.2 (SUSPICIOUS) | 68.8 (LIKELY FAKE) - the one case where extra coverage helped |
+
+This is exactly the trade-off described above playing out concretely:
+raising `--max-people` only paid off for `example3`, which actually has
+simultaneous people; for the other two it just added noise and pushed an
+otherwise-clear verdict toward "inconclusive". If you're not sure whether
+your footage has genuinely simultaneous people, it's worth running both
+and comparing, rather than assuming a higher `--max-people` is strictly
+better.
+
+## Object detection
+
+`detector/object_detection.py` wraps MediaPipe's `ObjectDetector` Task
+(EfficientDet-Lite0, COCO's 80 everyday-object classes) and tracks each
+detected object across frames with simple greedy same-category IoU
+matching (`ObjectTracker`) - lighter-weight and more tolerant of gaps than
+the person tracker, since generic object detection is noisier. The
+generic "person" class is excluded from detection since people are
+already tracked far more precisely by the dedicated face/pose pipeline.
+
+`detector/object_checks.py` mirrors the landmark-based glitch checks for
+tracked objects:
+
+- **`object_flicker`**: an object's detection flickers on/off repeatedly
+  in a short rolling window.
+- **`object_size_jump`**: an object's bounding-box area changes far faster
+  (robust z-score against its own recent history) than ordinary motion
+  would explain.
+- **`object_teleport`**: an object's center position jumps further,
+  relative to its own size, than its own recent baseline.
+
+**Calibration result: computed, but excluded from the score (0 weight).**
+Following this project's standing rule of validating every heuristic
+against real footage before trusting it (the same process that got the
+finger-geometry hand checks disabled), these were tested against both a
+confirmed-real and a confirmed-fake clip and rejected as scoring evidence:
+EfficientDet-Lite0's own detection noise turned out to be *at least as
+large on real footage as on fake footage*, so it has no practical
+discriminative power.
+
+| Clip | What happened |
+|---|---|
+| `real_baseline.mp4` (genuine webcam clip) | A misclassified background object flickered on/off as `tv` 4-8x within a 15-frame window (`object_flicker` up to 1.0), and its box area jumped hard enough to saturate the size-jump z-score check (z > 30) - purely from detector instability on an ordinary, static background object. |
+| Confirmed-fake clip | The exact same failure mode appeared just as readily: a person's own head flickered between classified-as-`umbrella` and no detection 7-10x in a window (`object_flicker` = 1.0) - not a fake-specific tell, just the same detector noise. |
+
+Both checks still run every frame and remain visible in the JSON report's
+`category_breakdown` and in the annotated video (tracked objects are
+boxed/labeled; a box turns red if one of these signals fired on it) for
+manual inspection - they're just not trusted as automatic scoring
+evidence given the above. See `detector/object_checks.py` and the
+`object_*` entries in `detector/scoring.py`'s `DEFAULT_WEIGHTS` for the
+full reasoning.
 
 ## Localized blur checks
 
@@ -249,6 +383,17 @@ classifier. That means:
   in heavy low-light noise-reduction, or re-encoded at a generous bitrate
   from an already-soft source - so treat a flag from it as a strong hint
   to look closer, not a standalone verdict.
+- Multi-person tracking (`--max-people` > 1) is a lightweight heuristic
+  centroid tracker, not a trained re-identification model - two people
+  crossing paths closely can swap ids (this costs a cold-start warm-up
+  window for the checks involved, not a false fake signal, since every
+  check already returns 0 until it has enough fresh history). It also
+  measurably increases landmark-jitter noise for every tracked person -
+  see [Multi-person tracking](#multi-person-tracking) for the numbers.
+- Object detection/tracking (`object_flicker`/`object_size_jump`/
+  `object_teleport`) is computed and shown for manual review but
+  deliberately excluded from the score - see
+  [Object detection](#object-detection) for why.
 
 Treat the score as a rough, explainable signal to prioritize manual review,
 not a definitive verdict.
@@ -257,7 +402,8 @@ not a definitive verdict.
 
 All thresholds and category weights live at the top of
 `detector/glitch_detection.py`, `detector/physics_checks.py`,
-`detector/blur_checks.py`, `detector/quality_checks.py`, and
+`detector/blur_checks.py`, `detector/quality_checks.py`,
+`detector/person_tracker.py`, `detector/object_checks.py`, and
 `detector/scoring.py`. If you find too many false positives/negatives on
 your footage, adjust the constants there.
 
@@ -267,14 +413,17 @@ your footage, adjust the constants there.
 main.py                     CLI entry point
 detector/
   capture.py                Video file / webcam frame source
-  landmarks.py               MediaPipe Face Mesh + Pose extraction
+  landmarks.py               MediaPipe Face Mesh + Pose + Hands extraction (multi-instance capable)
+  person_tracker.py           Cross-model association + cross-frame stable person ids
+  object_detection.py         EfficientDet-Lite0 object extraction + IoU-based object tracker
   history.py                 Rolling per-landmark history buffer
   glitch_detection.py        Jitter / jump / flicker anomaly checks
   physics_checks.py          Bone length / joint angle / head-pose / symmetry checks
   blur_checks.py              Localized blur checks (region mismatch / hand blur / blur spike)
   quality_checks.py           Whole-video blur-vs-bitrate check (file size/length vs. face sharpness)
   hand_checks.py              Finger bone-length/joint checks (implemented, NOT wired in - see README)
+  object_checks.py            Object flicker/size-jump/teleport checks (implemented, NOT scored - see README)
   scoring.py                 Aggregation into a final likelihood score + peak-burst diagnostic + global quality blend
-  visualizer.py               Drawing + annotated video writer
+  visualizer.py               Drawing + annotated video writer (multi-person + object aware)
   report.py                  JSON report + timeline chart
 ```

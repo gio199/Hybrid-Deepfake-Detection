@@ -8,7 +8,7 @@ data structure (`FrameLandmarks`) used by the rest of the pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import mediapipe as mp
 import numpy as np
@@ -149,6 +149,12 @@ class Landmark:
 
 @dataclass
 class FrameLandmarks:
+    """A single tracked *person's* landmarks in a single frame. When there
+    are multiple people in frame, one of these exists per tracked person
+    (see `person_tracker.py`, which builds these from the raw per-model
+    detection lists `MediaPipeExtractor.process_multi()` returns).
+    """
+
     frame_idx: int
     timestamp_sec: float
     image_w: int
@@ -180,17 +186,73 @@ class FrameLandmarks:
             return None
         return float(np.hypot(left.x - right.x, left.y - right.y))
 
+    def anchor_point(self) -> Optional[Tuple[float, float]]:
+        """A single representative (x, y) location for this person, used
+        by the cross-model association and cross-frame tracking in
+        `person_tracker.py`. Prefers the pose nose (most stable, present
+        even when the face is turned away) then falls back to the face
+        nose tip.
+        """
+        if self.pose_present and self.pose is not None:
+            p = self.pose[POSE_NOSE]
+            return (p.x, p.y)
+        if self.face_present and self.face is not None:
+            p = self.face[FACE_NOSE_TIP]
+            return (p.x, p.y)
+        return None
+
+    def scale_estimate(self) -> Optional[float]:
+        """A rough person-size estimate (pixels) used to normalize
+        tracking-match distances so the same absolute pixel gap counts as
+        "close" for a large near-camera person and "far" for a small
+        distant one.
+        """
+        if self.pose_present and self.pose is not None:
+            l_sh = self.pose[POSE_LEFT_SHOULDER]
+            r_sh = self.pose[POSE_RIGHT_SHOULDER]
+            span = float(np.hypot(l_sh.x - r_sh.x, l_sh.y - r_sh.y))
+            if span > 1e-3:
+                return span
+        width = self.face_width()
+        if width:
+            return width * 2.0  # shoulders are roughly ~2x face width
+        return None
+
+
+DEFAULT_MAX_PEOPLE = 1
+
+
+@dataclass
+class RawFrameDetections:
+    """The raw, per-model, per-frame output of `MediaPipeExtractor.process_multi()` -
+    i.e. before any cross-model association or cross-frame identity tracking has
+    happened. `person_tracker.py` consumes this to build one `FrameLandmarks` per
+    physical person.
+    """
+
+    frame_idx: int
+    timestamp_sec: float
+    image_w: int
+    image_h: int
+    faces: List[List[Landmark]] = field(default_factory=list)
+    poses: List[List[Landmark]] = field(default_factory=list)
+    pose_scores: List[float] = field(default_factory=list)
+    hands: List[List[Landmark]] = field(default_factory=list)
+    handedness: List[str] = field(default_factory=list)
+
 
 class MediaPipeExtractor:
-    """Runs MediaPipe's FaceLandmarker + PoseLandmarker (Tasks API) on
-    frames and returns FrameLandmarks.
+    """Runs MediaPipe's FaceLandmarker + PoseLandmarker + HandLandmarker
+    (Tasks API) on frames, detecting up to `max_people` people at once.
 
     Note: the legacy `mediapipe.solutions.face_mesh` / `.pose` API was
     removed from the mediapipe package in version 0.10.30+, so this uses
     the modern Tasks API with locally-cached model bundles instead.
     """
 
-    def __init__(self, min_detection_confidence: float = 0.5, min_tracking_confidence: float = 0.5):
+    def __init__(self, min_detection_confidence: float = 0.5, min_tracking_confidence: float = 0.5,
+                 max_people: int = DEFAULT_MAX_PEOPLE):
+        self.max_people = max_people
         face_model_path = ensure_model("face_landmarker.task")
         pose_model_path = ensure_model("pose_landmarker_full.task")
         hand_model_path = ensure_model("hand_landmarker.task")
@@ -198,7 +260,7 @@ class MediaPipeExtractor:
         face_options = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=face_model_path),
             running_mode=vision.RunningMode.VIDEO,
-            num_faces=1,
+            num_faces=max_people,
             min_face_detection_confidence=min_detection_confidence,
             min_face_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
@@ -210,7 +272,7 @@ class MediaPipeExtractor:
         pose_options = vision.PoseLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=pose_model_path),
             running_mode=vision.RunningMode.VIDEO,
-            num_poses=1,
+            num_poses=max_people,
             min_pose_detection_confidence=min_detection_confidence,
             min_pose_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
@@ -221,14 +283,19 @@ class MediaPipeExtractor:
         hand_options = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=hand_model_path),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
+            num_hands=max_people * 2,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
         self._hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
 
-    def process(self, frame_bgr: np.ndarray, frame_idx: int, timestamp_sec: float) -> FrameLandmarks:
+    def process_multi(self, frame_bgr: np.ndarray, frame_idx: int, timestamp_sec: float) -> RawFrameDetections:
+        """Runs all three models on one frame and returns their raw,
+        unassociated per-model detection lists (one entry per detected
+        face/pose/hand, in whatever order MediaPipe returns them - there is
+        no cross-model correspondence yet).
+        """
         h, w = frame_bgr.shape[:2]
         rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -242,33 +309,24 @@ class MediaPipeExtractor:
         pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
         hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        result = FrameLandmarks(frame_idx=frame_idx, timestamp_sec=timestamp_sec, image_w=w, image_h=h)
+        result = RawFrameDetections(frame_idx=frame_idx, timestamp_sec=timestamp_sec, image_w=w, image_h=h)
 
-        if face_result.face_landmarks:
-            mesh = face_result.face_landmarks[0]
-            result.face = [Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in mesh]
-            result.face_present = True
-            result.face_detection_score = 1.0
+        for mesh in face_result.face_landmarks:
+            result.faces.append([Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in mesh])
 
-        if pose_result.pose_landmarks:
-            pts = pose_result.pose_landmarks[0]
-            result.pose = [
+        for pts in pose_result.pose_landmarks:
+            result.poses.append([
                 Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w, visibility=lm.visibility or 1.0) for lm in pts
-            ]
-            result.pose_present = True
+            ])
             visibilities = [lm.visibility or 1.0 for lm in pts]
-            result.pose_detection_score = float(np.mean(visibilities)) if visibilities else 0.0
+            result.pose_scores.append(float(np.mean(visibilities)) if visibilities else 0.0)
 
-        if hand_result.hand_landmarks:
-            result.hands = [
-                [Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in hand]
-                for hand in hand_result.hand_landmarks
-            ]
-            result.handedness = [
-                categories[0].category_name if categories else "Unknown"
-                for categories in hand_result.handedness
-            ]
-            result.hands_present = True
+        for hand in hand_result.hand_landmarks:
+            result.hands.append([Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in hand])
+        result.handedness = [
+            categories[0].category_name if categories else "Unknown"
+            for categories in hand_result.handedness
+        ]
 
         return result
 

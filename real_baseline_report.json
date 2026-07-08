@@ -7,8 +7,10 @@
     "height": 720,
     "frames_processed": 168,
     "duration_sec": 7.01,
-    "processing_time_sec": 8.77,
-    "file_size_bytes": 2400422
+    "processing_time_sec": 12.48,
+    "file_size_bytes": 2400422,
+    "max_people": 1,
+    "object_detection_enabled": true
   },
   "result": {
     "final_score": 27.9,
@@ -18,7 +20,9 @@
     "peak_window_score": 84.3,
     "peak_window_timestamp_sec": 6.42,
     "global_quality_score": 0.0,
-    "global_quality_reason": ""
+    "global_quality_reason": "",
+    "max_people_detected": 1,
+    "people_track_count": 1
   },
   "category_breakdown": {
     "blur_mismatch": {
@@ -66,6 +70,21 @@
       "peak": 0.8021819760853675,
       "frame_frac": 0.22023809523809523
     },
+    "object_flicker": {
+      "mean": 0.18601190476190477,
+      "peak": 0.75,
+      "frame_frac": 0.4226190476190476
+    },
+    "object_size_jump": {
+      "mean": 0.11235597436539389,
+      "peak": 1.0,
+      "frame_frac": 0.1488095238095238
+    },
+    "object_teleport": {
+      "mean": 0.0,
+      "peak": 0.0,
+      "frame_frac": 0.0
+    },
     "pixel_flicker": {
       "mean": 0.00898945420602221,
       "peak": 0.8218481181011599,
@@ -93,6 +112,8 @@
       "peak_score": 1.0,
       "categories": [
         "landmark_jump",
+        "object_flicker",
+        "object_size_jump",
         "symmetry_break"
       ]
     },
@@ -104,6 +125,8 @@
         "bone_length",
         "landmark_jitter",
         "landmark_jump",
+        "object_flicker",
+        "object_size_jump",
         "pixel_flicker"
       ]
     },
@@ -113,7 +136,9 @@
       "peak_score": 1.0,
       "categories": [
         "head_pose_reprojection",
-        "landmark_jitter"
+        "landmark_jitter",
+        "object_flicker",
+        "object_size_jump"
       ]
     },
     {
@@ -123,6 +148,7 @@
       "categories": [
         "landmark_jitter",
         "landmark_jump",
+        "object_flicker",
         "pixel_flicker"
       ]
     },
@@ -135,6 +161,7 @@
         "bone_length",
         "landmark_jitter",
         "landmark_jump",
+        "object_flicker",
         "symmetry_break"
       ]
     }

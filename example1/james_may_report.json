@@ -1,24 +1,28 @@
 {
   "video": {
-    "source": "example1\\deep fake examples - James May (720p).mp4",
+    "source": "example1/deep fake examples - James May (720p).mp4",
     "is_webcam": false,
     "fps": 30.0,
     "width": 1280,
     "height": 720,
     "frames_processed": 1152,
     "duration_sec": 38.4,
-    "processing_time_sec": 52.68,
-    "file_size_bytes": 3752035
+    "processing_time_sec": 97.7,
+    "file_size_bytes": 3752035,
+    "max_people": 1,
+    "object_detection_enabled": true
   },
   "result": {
-    "final_score": 22.1,
+    "final_score": 21.9,
     "verdict": "LIKELY REAL",
     "frames_evaluated": 1103,
     "frames_total": 1152,
     "peak_window_score": 100.0,
     "peak_window_timestamp_sec": 11.9,
     "global_quality_score": 0.0,
-    "global_quality_reason": ""
+    "global_quality_reason": "",
+    "max_people_detected": 2,
+    "people_track_count": 6
   },
   "category_breakdown": {
     "blur_mismatch": {
@@ -27,14 +31,14 @@
       "frame_frac": 0.0009066183136899365
     },
     "blur_onset_spike": {
-      "mean": 0.01837692156789231,
+      "mean": 0.018467044247613057,
       "peak": 1.0,
       "frame_frac": 0.027198549410698096
     },
     "bone_length": {
-      "mean": 0.13079522443284583,
+      "mean": 0.12419340145988457,
       "peak": 1.0,
-      "frame_frac": 0.17135086128739802
+      "frame_frac": 0.1659111514052584
     },
     "detection_flicker": {
       "mean": 0.0,
@@ -47,34 +51,49 @@
       "frame_frac": 0.0
     },
     "head_pose_reprojection": {
-      "mean": 0.02358694783866801,
+      "mean": 0.023346439413663007,
       "peak": 1.0,
-      "frame_frac": 0.05530371713508613
+      "frame_frac": 0.05439709882139619
     },
     "joint_angle_motion": {
-      "mean": 0.01427989350985786,
+      "mean": 0.01156003856878805,
       "peak": 1.0,
-      "frame_frac": 0.014505893019038985
+      "frame_frac": 0.011786038077969175
     },
     "landmark_jitter": {
-      "mean": 0.059983527165286314,
-      "peak": 1.0,
-      "frame_frac": 0.27379873073436084
+      "mean": 0.05774661676015266,
+      "peak": 0.9424063292093089,
+      "frame_frac": 0.2756119673617407
     },
     "landmark_jump": {
-      "mean": 0.0413900528161781,
+      "mean": 0.04047440656057662,
       "peak": 1.0,
-      "frame_frac": 0.08975521305530372
+      "frame_frac": 0.08884859474161379
+    },
+    "object_flicker": {
+      "mean": 0.025385312783318223,
+      "peak": 1.0,
+      "frame_frac": 0.07162284678150499
+    },
+    "object_size_jump": {
+      "mean": 0.0002329017583440379,
+      "peak": 0.2568906394534738,
+      "frame_frac": 0.0009066183136899365
+    },
+    "object_teleport": {
+      "mean": 0.0,
+      "peak": 0.0,
+      "frame_frac": 0.0
     },
     "pixel_flicker": {
-      "mean": 0.0010113919367545014,
+      "mean": 0.0009931412135480943,
       "peak": 0.1886148409092846,
-      "frame_frac": 0.009066183136899365
+      "frame_frac": 0.008159564823209429
     },
     "symmetry_break": {
-      "mean": 0.04734927844438955,
+      "mean": 0.04571618734468071,
       "peak": 1.0,
-      "frame_frac": 0.05349048050770626
+      "frame_frac": 0.051677243880326386
     }
   },
   "flagged_ranges": [
@@ -191,30 +210,6 @@
       ]
     },
     {
-      "start_frame": 193,
-      "end_frame": 194,
-      "peak_score": 1.0,
-      "categories": [
-        "bone_length",
-        "head_pose_reprojection",
-        "joint_angle_motion",
-        "landmark_jitter",
-        "landmark_jump",
-        "symmetry_break"
-      ]
-    },
-    {
-      "start_frame": 207,
-      "end_frame": 207,
-      "peak_score": 1.0,
-      "categories": [
-        "bone_length",
-        "joint_angle_motion",
-        "landmark_jitter",
-        "landmark_jump"
-      ]
-    },
-    {
       "start_frame": 348,
       "end_frame": 348,
       "peak_score": 0.565,
@@ -259,7 +254,9 @@
         "bone_length",
         "joint_angle_motion",
         "landmark_jitter",
-        "landmark_jump"
+        "landmark_jump",
+        "object_flicker",
+        "object_size_jump"
       ]
     },
     {
@@ -317,7 +314,6 @@
       "end_frame": 609,
       "peak_score": 1.0,
       "categories": [
-        "blur_onset_spike",
         "bone_length",
         "joint_angle_motion",
         "landmark_jitter",
@@ -343,6 +339,15 @@
       "peak_score": 0.958,
       "categories": [
         "bone_length",
+        "landmark_jitter"
+      ]
+    },
+    {
+      "start_frame": 647,
+      "end_frame": 647,
+      "peak_score": 0.478,
+      "categories": [
+        "blur_onset_spike",
         "landmark_jitter"
       ]
     },
@@ -448,7 +453,8 @@
       "peak_score": 1.0,
       "categories": [
         "bone_length",
-        "head_pose_reprojection"
+        "head_pose_reprojection",
+        "object_flicker"
       ]
     },
     {
@@ -2971,8 +2977,6 @@
       0.0,
       0.0,
       0.0,
-      1.0,
-      1.0,
       0.0,
       0.0,
       0.0,
@@ -2985,7 +2989,9 @@
       0.0,
       0.0,
       0.0,
-      1.0,
+      0.0,
+      0.0,
+      0.0,
       0.0,
       0.0,
       0.0,
@@ -3042,11 +3048,11 @@
       0.0341,
       0.035,
       0.0354,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
+      0.0355,
+      0.0383,
+      0.0409,
+      0.0428,
+      0.0436,
       0.0,
       0.0,
       0.0,
@@ -3262,7 +3268,7 @@
       0.0,
       0.0,
       0.0,
-      0.0,
+      0.0089,
       0.0,
       0.0,
       0.0,
@@ -3425,8 +3431,8 @@
       0.113,
       0.1149,
       0.1165,
-      0.2395,
-      0.1479,
+      0.4776,
+      0.342,
       0.1288,
       0.1308,
       0.1314,
@@ -3526,9 +3532,9 @@
       0.0723,
       0.0724,
       0.0691,
-      0.0692,
+      0.0691,
       0.0676,
-      0.0859,
+      0.0671,
       0.0478,
       0.0,
       0.0,
