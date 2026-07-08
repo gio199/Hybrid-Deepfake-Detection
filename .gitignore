@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Auto-downloaded MediaPipe model bundles (fetched on first run, see README)
+models/
+
+# Default output artifacts from ad-hoc `python main.py` runs
+output_annotated.mp4
+report.json
+report_timeline.png
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
