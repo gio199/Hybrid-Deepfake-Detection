@@ -43,6 +43,88 @@ Video/Webcam -> Frame capture -> MediaPipe FaceMesh+Pose+Hands (multi-instance)
              -> Annotated video (all people + objects) + JSON report + timeline chart
 ```
 
+## Architecture diagram
+
+```mermaid
+flowchart TD
+    subgraph INPUT["შესავალი მონაცემები"]
+        A1["ვიდეო ფაილი<br/>(--input)"]
+        A2["ვები-კამერა<br/>(--webcam)"]
+    end
+
+    A1 --> B["კადრის აღება<br/>capture.py"]
+    A2 --> B
+
+    B --> C1["სახის მოდელი<br/>FaceLandmarker (N პიროვნება)"]
+    B --> C2["პოზის მოდელი<br/>PoseLandmarker (N პიროვნება)"]
+    B --> C3["ხელის მოდელი<br/>HandLandmarker (2N ხელი)"]
+    B --> C4["ობიექტის დეტექტორი<br/>EfficientDet-Lite0"]
+    C1 & C2 & C3 & C4 -.-> LM["landmarks.py /<br/>object_detection.py"]
+
+    C1 --> D["დუბლიკატი პოზების/სახეების<br/>გაფილტვრა (NMS) +<br/>ჯვარედინი მოდელების შესატყვისება"]
+    C2 --> D
+    C3 --> D
+    D --> E["სტაბილური person_id<br/>კადრიდან კადრში<br/>person_tracker.py"]
+
+    C4 --> F["ობიექტების ტრეკინგი<br/>(IoU შესატყვისება)<br/>object_detection.py"]
+
+    E --> G1["პიროვნება #1:<br/>ისტორია + გლიტჩი +<br/>ფიზიკა + გაბუნდოვნება"]
+    E --> G2["პიროვნება #N:<br/>დამოუკიდებელი<br/>მდგომარეობა"]
+
+    F --> H["ობიექტის ანომალიები:<br/>ციმციმი / ზომის ხტომა /<br/>გადატელეპორტება<br/>(წონა = 0, საინფორმაციო)"]
+
+    G1 --> I["კადრის ყველაზე<br/>'ცუდი' პიროვნების შერჩევა"]
+    G2 --> I
+
+    I --> J["სიგნალების გაერთიანება<br/>(noisy-OR წონიანი ჯამი)<br/>scoring.py"]
+    H --> J
+
+    A1 --> K["მთლიანი ვიდეოს<br/>ბიტრეიტი vs სახის სისუფთავე<br/>quality_checks.py"]
+
+    J --> L["ანომალიების აგრეგატორი<br/>AnomalyAggregator"]
+    K --> L
+
+    L --> M["საბოლოო ქულა (0-100%)<br/>და ვერდიქტი"]
+
+    M --> N1["ანოტირებული ვიდეო<br/>visualizer.py"]
+    M --> N2["JSON რეპორტი<br/>report.py"]
+    M --> N3["დროის ღერძის<br/>დიაგრამა (PNG)"]
+
+    style G1 fill:#2b6,color:#fff
+    style G2 fill:#2b6,color:#fff
+    style H fill:#888,color:#fff
+    style L fill:#c33,color:#fff
+```
+
+<details>
+<summary>Legend (Georgian annotation -> English)</summary>
+
+| Georgian | English |
+|---|---|
+| შესავალი მონაცემები | Input data |
+| კადრის აღება | Frame capture |
+| სახის/პოზის/ხელის მოდელი | Face/pose/hand model |
+| დუბლიკატის გაფილტვრა | Duplicate filtering (NMS) |
+| სტაბილური person_id | Stable person_id |
+| ობიექტების ტრეკინგი | Object tracking |
+| პიროვნება | Person |
+| ისტორია | History |
+| გლიტჩი/ფიზიკა/გაბუნდოვნება | Glitch/physics/blur (checks) |
+| ციმციმი / ზომის ხტომა / გადატელეპორტება | Flicker / size jump / teleport |
+| საინფორმაციო | Informational (i.e. not scored) |
+| სიგნალების გაერთიანება | Signal combination |
+| ანომალიების აგრეგატორი | Anomaly aggregator |
+| საბოლოო ქულა და ვერდიქტი | Final score and verdict |
+| ანოტირებული ვიდეო | Annotated video |
+| რეპორტი / დიაგრამა | Report / chart |
+
+</details>
+
+The green nodes are the per-person independent pipelines, the gray node is
+the object-check path (computed but excluded from scoring, per the
+calibration findings below), and the red node is where everything
+converges into the final score.
+
 ## Installation
 
 ```bash
@@ -412,6 +494,7 @@ your footage, adjust the constants there.
 ```
 main.py                     CLI entry point
 detector/
+  __init__.py                Package marker + version
   capture.py                Video file / webcam frame source
   landmarks.py               MediaPipe Face Mesh + Pose + Hands extraction (multi-instance capable)
   person_tracker.py           Cross-model association + cross-frame stable person ids
@@ -426,4 +509,37 @@ detector/
   scoring.py                 Aggregation into a final likelihood score + peak-burst diagnostic + global quality blend
   visualizer.py               Drawing + annotated video writer (multi-person + object aware)
   report.py                  JSON report + timeline chart
+  model_utils.py              Downloads/caches the MediaPipe model bundles
 ```
+
+## Python scripts in detail
+
+| Script | What it does |
+|---|---|
+| `main.py` | CLI entry point (`argparse`-based). Wires every module below into one loop: reads frames, runs multi-person + object extraction/tracking, updates each tracked person's own checker pipeline, picks the worst-scoring person per frame, blends in the whole-video quality signal, then writes the annotated video, JSON report, and timeline chart. Also owns the `PersonPipeline` dataclass (per-person bundle of `LandmarkHistory` + `GlitchDetector` + `PhysicsChecker` + `BlurChecker`) and prints the CLI summary. |
+| `detector/capture.py` | Thin wrapper around `cv2.VideoCapture` that unifies video-file and webcam input behind one iterator (`FrameSource`), yielding `FrameInfo(index, timestamp_sec, frame)` per frame and handling fps/resolution/frame-count quirks (e.g. webcams that don't report fps). |
+| `detector/landmarks.py` | Wraps MediaPipe's `FaceLandmarker`/`PoseLandmarker`/`HandLandmarker` (Tasks API). Configurable for multi-instance detection (`max_people`) and exposes both the raw, unassociated per-model detections (`RawFrameDetections`, via `process_multi()`) and the single-person `FrameLandmarks` container/helpers (anchor point, scale estimate, bone/point lookups) used throughout the rest of the pipeline. |
+| `detector/person_tracker.py` | Turns the raw per-model detections into stable per-person identities: same-frame NMS to remove MediaPipe's duplicate "ghost" pose/face detections, nose-to-nose/wrist-proximity association across face/pose/hand models, then a lightweight nearest-anchor centroid tracker (`MultiPersonTracker`) that keeps a consistent `person_id` across frames. |
+| `detector/object_detection.py` | Wraps MediaPipe's `ObjectDetector` Task (EfficientDet-Lite0) for generic object detection (`ObjectExtractor`) and a greedy same-category IoU tracker (`ObjectTracker`) that assigns stable `object_id`s across frames, tolerating brief detection gaps. |
+| `detector/history.py` | The `LandmarkHistory` rolling buffer (last N frames per tracked person) plus shared statistics helpers (displacement, robust z-score) used by nearly every check module. Also defines the common `Signal(name, score, reason)` type every check returns. |
+| `detector/glitch_detection.py` | Temporal-only checks that don't know anatomy: `landmark_jitter`, `landmark_jump` (teleporting points), `detection_flicker` (on/off flicker), `pixel_flicker` (face-region pixel-level flicker, a common face-swap blending-seam artifact). |
+| `detector/physics_checks.py` | Anatomy-aware checks: `bone_length` consistency, `joint_angle_motion` limits, `head_pose_reprojection` error, and left/right `symmetry_break`. |
+| `detector/blur_checks.py` | Localized/selective blur checks: `blur_mismatch` (face blurrier than background), `hand_blur_anomaly` (informational only, see caveats), `blur_onset_spike` (sudden face-sharpness drop). Also accumulates the whole-video face-sharpness samples that `quality_checks.py` consumes. |
+| `detector/quality_checks.py` | The single whole-video (not per-frame) check: bits-per-pixel vs. median face sharpness, to catch a video encoded generously yet suspiciously soft throughout. |
+| `detector/hand_checks.py` | Finger bone-length/joint-angle checks - implemented but **not wired into `main.py`**, kept as a documented, rejected experiment (too noisy under natural fast hand motion - see README). |
+| `detector/object_checks.py` | Object-level anomaly checks (`object_flicker`/`object_size_jump`/`object_teleport`) mirroring `glitch_detection.py` for tracked objects - implemented and computed every frame, but weighted to 0 in scoring (see [Object detection](#object-detection)). |
+| `detector/scoring.py` | `AnomalyAggregator`: combines every frame's `Signal`s into a per-frame score (weighted noisy-OR, via the shared `combine_signals()` helper), then aggregates the whole video into a final 0-100 score + verdict, peak-burst diagnostic, and category breakdown. Owns `DEFAULT_WEIGHTS`, the single source of truth for which checks are trusted for scoring. |
+| `detector/visualizer.py` | Draws the annotated output frame: each tracked person's face mesh/pose skeleton/hands in its own color and `P<id>` label, red highlights on whichever landmarks triggered a rule, tracked object boxes (red if flagged), and the running score panel. `AnnotatedVideoWriter` wraps `cv2.VideoWriter`. |
+| `detector/report.py` | Builds the final JSON report (video metadata, score, category breakdown, flagged ranges, downsampled timeline) and renders the `<report>_timeline.png` chart via `matplotlib`. |
+| `detector/model_utils.py` | Downloads and caches the four MediaPipe model bundles (`face_landmarker.task`, `pose_landmarker_full.task`, `hand_landmarker.task`, `efficientdet_lite0.tflite`) into `models/` on first use. |
+
+## Libraries used
+
+| Library | Used for |
+|---|---|
+| [`mediapipe`](https://developers.google.com/mediapipe) | The core ML backbone - `FaceLandmarker`, `PoseLandmarker`, `HandLandmarker`, and `ObjectDetector` (Tasks API) provide all landmark/object detections this project's heuristics run on. No custom model training - everything downstream is rule-based on top of these pretrained models. |
+| [`opencv-python`](https://pypi.org/project/opencv-python/) (`cv2`) | Video/webcam I/O (`VideoCapture`/`VideoWriter`), all frame-level image processing (crops, resizing, color conversion), the Laplacian-variance sharpness metric used by the blur checks, and drawing the annotated overlay (meshes, skeletons, boxes, text). |
+| [`numpy`](https://numpy.org/) | Vectorized math throughout: landmark coordinate arrays, displacement/distance calculations, robust z-score statistics, and the IoU/geometry math in the object tracker. |
+| [`scipy`](https://scipy.org/) | Listed as a dependency for statistical helpers (e.g. robust/median-based outlier stats as an alternative to plain mean/stddev); the current robust z-score math in `history.py` is implemented directly with `numpy`, so this is currently a reserved/no-op dependency rather than an actively imported one. |
+| [`matplotlib`](https://matplotlib.org/) | Renders the `<report>_timeline.png` anomaly-score-over-time chart in `report.py`. |
+| [`tqdm`](https://tqdm.github.io/) | The progress bar shown in the CLI while processing a video file (`main.py`). |
