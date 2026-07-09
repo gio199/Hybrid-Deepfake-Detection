@@ -125,6 +125,48 @@ the object-check path (computed but excluded from scoring, per the
 calibration findings below), and the red node is where everything
 converges into the final score.
 
+## Fake Video Detection Algorithm
+
+The fake-likelihood scoring is mathematically designed to combine independent, weak pieces of anomalous evidence into a strong final verdict. The algorithm operates in two phases: per-frame signal aggregation and whole-video temporal aggregation.
+
+### 1. Per-Frame Signal Aggregation (Noisy-OR)
+
+Each frame generates a set of anomaly signals $S = \{s_1, s_2, \dots, s_n\}$ from the various glitch, physics, and blur checks. Each signal yields a raw anomaly score $s_i \in [0, 1]$. To combine these signals, the algorithm uses a **weighted noisy-OR** formulation.
+
+Let $w_i$ be the predefined trust weight for the $i$-th category (e.g., rigid-body physics violations are weighted heavily, while simple pixel flicker is weighted lower). The capped contribution $c_i$ of each signal is:
+
+$$ c_i = \min(1.0, w_i \times s_i) $$
+
+The combined anomaly score $F$ for the frame is computed by calculating the "survival" probability (the probability that the frame is completely real, assuming all red flags are independent):
+
+$$ F = 1.0 - \prod_{i=1}^{n} (1.0 - c_i) $$
+
+**Scientific Explanation:** This probabilistic approach ensures that multiple independent, weak artifacts (e.g., a slight landmark jitter and a minor blur mismatch) compound smoothly to raise suspicion, while a single catastrophic failure (e.g., an impossible bone-length change where $c_i = 1.0$) immediately pushes the frame's fake-likelihood to 100%.
+
+### 2. Whole-Video Temporal Aggregation
+
+Deepfake artifacts are typically localized in time (e.g., a face-swap breaking during a fast head turn). Thus, the video-level score balances the *average anomaly intensity* against the *frequency of severe anomalies*.
+
+Let $N$ be the total number of evaluated frames with detections.
+Let $F_j$ be the combined score of the $j$-th frame.
+We compute the mean anomaly score $\mu$:
+
+$$ \mu = \frac{1}{N} \sum_{j=1}^{N} F_j $$
+
+We also compute the fraction of strictly flagged frames $P_{\text{flag}}$ (frames where $F_j \ge 0.4$):
+
+$$ P_{\text{flag}} = \frac{|\{ j \mid F_j \ge 0.4 \}|}{N} $$
+
+Finally, an independent global quality score $Q \in [0, 1]$ is extracted from the whole-video bits-per-pixel vs. face sharpness check. 
+
+The final video fake-likelihood score $L$ is a weighted additive combination:
+
+$$ L = \min\left(1.0, \left( W_{\text{mean}} \times \mu \right) + \left( W_{\text{flag}} \times P_{\text{flag}} \right) + \left( W_{\text{global}} \times Q \right) \right) \times 100\% $$
+
+Currently, $W_{\text{mean}} = 0.5$, $W_{\text{flag}} = 0.5$, and $W_{\text{global}} = 0.35$. 
+
+**Scientific Explanation:** Using both $\mu$ and $P_{\text{flag}}$ makes the algorithm robust to both continuous low-grade artifacts (which raise $\mu$) and sudden, severe, but brief glitches (which raise $P_{\text{flag}}$). A simple peak-burst metric was rejected through empirical testing because real-world tracking noise can occasionally produce isolated 1-frame spikes, whereas a true deepfake artifact typically persists over enough frames to affect the flagged fraction. The global term $Q$ acts as a secondary multiplier for videos that are suspiciously blurry despite generous encoding bitrates.
+
 ## Installation
 
 ```bash
