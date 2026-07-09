@@ -514,6 +514,8 @@ detector/
 
 ## Python scripts in detail
 
+Below is a detailed description of all Python files in the project (17 files: `main.py` + 16 files in the `detector/` package) - what each file does, what classes/functions it contains, and how it integrates into the overall pipeline.
+
 | Script | What it does |
 |---|---|
 | `main.py` | CLI entry point (`argparse`-based). Wires every module below into one loop: reads frames, runs multi-person + object extraction/tracking, updates each tracked person's own checker pipeline, picks the worst-scoring person per frame, blends in the whole-video quality signal, then writes the annotated video, JSON report, and timeline chart. Also owns the `PersonPipeline` dataclass (per-person bundle of `LandmarkHistory` + `GlitchDetector` + `PhysicsChecker` + `BlurChecker`) and prints the CLI summary. |
@@ -532,6 +534,127 @@ detector/
 | `detector/visualizer.py` | Draws the annotated output frame: each tracked person's face mesh/pose skeleton/hands in its own color and `P<id>` label, red highlights on whichever landmarks triggered a rule, tracked object boxes (red if flagged), and the running score panel. `AnnotatedVideoWriter` wraps `cv2.VideoWriter`. |
 | `detector/report.py` | Builds the final JSON report (video metadata, score, category breakdown, flagged ranges, downsampled timeline) and renders the `<report>_timeline.png` chart via `matplotlib`. |
 | `detector/model_utils.py` | Downloads and caches the four MediaPipe model bundles (`face_landmarker.task`, `pose_landmarker_full.task`, `hand_landmarker.task`, `efficientdet_lite0.tflite`) into `models/` on first use. |
+
+### `main.py` - CLI entry point
+
+This is the main executable file of the program, which parses command line arguments using `argparse` (`--input`/`--webcam`, `--output`, `--report`, `--max-people`, `--history-window`, `--no-object-detection`, etc.) and runs the main processing loop:
+
+- Opens the video source (`FrameSource`) and reads frames one by one.
+- On each frame, runs multi-person landmark extraction (`MediaPipeExtractor.process_multi`) and object detection (`ObjectExtractor`), then assigns tracking for both (`MultiPersonTracker`, `ObjectTracker`).
+- Maintains an independent "pipeline" for each tracked person (`PersonPipeline` - a `dataclass` containing `LandmarkHistory` + `GlitchDetector` + `PhysicsChecker` + `BlurChecker`), so that one person's motion/blur history doesn't contaminate another's baselines.
+- The `_people_with_scores` function updates each tracked person's pipeline every frame, aggregates signals, and selects the **worst-scoring person** - their signals determine the frame's overall anomaly level.
+- Idle person pipelines that haven't appeared for more than `PERSON_IDLE_DROP_FRAMES` (300) frames are removed from memory.
+- Finally, in the case of a video file, it runs the whole-video bitrate-vs-sharpness check (`assess_blur_vs_bitrate`) and aggregates all results via `AnomalyAggregator.finalize`.
+- Writes the annotated video (`AnnotatedVideoWriter`), JSON report, and timeline chart (`save_report`), and prints a summary text to the terminal (`_print_summary`) - score, verdict, frames processed, top signals, and output file paths.
+
+### `detector/__init__.py` - Package marker
+
+A minimal file that makes the `detector` folder a Python package and stores the version number. It contains no logic of its own.
+
+### `detector/capture.py` - Video/webcam frame reader
+
+Wraps `cv2.VideoCapture` in a unified interface (`FrameSource`) that works identically for both video files and webcams:
+
+- `FrameInfo` (`dataclass`) stores a single frame's index, timestamp (in seconds), and the image itself (`numpy`/`cv2` array).
+- `FrameSource` is an iterator (`__iter__`/`__next__`), so it can be used directly like `for frame_info in source:`.
+- Automatically calculates fps, width/height, and total frame count, and has "built-in" protection against webcams that don't report fps (in which case it assumes 30 fps).
+- The `--max-frames` parameter is implemented exactly here - throwing `StopIteration` after enough frames.
+
+### `detector/landmarks.py` - MediaPipe face/pose/hand extraction
+
+Wraps MediaPipe's modern Tasks API (`FaceLandmarker`, `PoseLandmarker`, `HandLandmarker`) in the `MediaPipeExtractor` class:
+
+- Configurable for simultaneous multi-person detection (`max_people` parameter sets `num_faces`/`num_poses` in MediaPipe models).
+- `process_multi()` returns raw, not-yet-associated per-model detections (`RawFrameDetections`) - these are later paired by `person_tracker.py`.
+- Also contains the single-person helper container `FrameLandmarks` (anchor point, scale estimate, bone and point lookup functions) used by the rest of the project.
+
+### `detector/person_tracker.py` - Assigning stable person_ids
+
+Turns raw per-model detections into stable, temporally consistent person identities in two steps:
+
+1. **Cross-model association** - Faces and poses are paired by nose-to-nose proximity (scaled to face size), hands are assigned to the person whose wrist is closest. A Non-Maximum Suppression (NMS) pass (`_deduplicate_poses`/`_deduplicate_faces`) cleans up MediaPipe's known "ghost" duplicate pose/face detections that appear when `num_poses`/`num_faces` > 1.
+2. **Cross-frame identity** - A simple, non-learned "centroid tracker" (`MultiPersonTracker`) that keeps the same `person_id` from frame to frame by matching with the nearest anchor point, with a tolerance of 15 missed frames before "retiring" an identity.
+
+### `detector/object_detection.py` - Generic object detection/tracking
+
+`ObjectExtractor` wraps MediaPipe's `ObjectDetector` Task (EfficientDet-Lite0, COCO's 80 everyday object classes), while `ObjectTracker` assigns a stable `object_id` to each detected object across frames using simple greedy same-category IoU (Intersection-over-Union) matching. The "person" class is intentionally excluded because people are tracked much more accurately by the face/pose pipeline.
+
+### `detector/history.py` - Rolling history buffer
+
+Defines the `LandmarkHistory` class - a rolling buffer of the last N frames (configurable via `--history-window`), maintained separately for each tracked person. It also contains shared statistical helpers (displacement, robust z-score calculation to find outliers) used by almost all check modules. Finally, it defines the common `Signal(name, score, reason)` type that every check returns.
+
+### `detector/glitch_detection.py` - Temporal (anatomy-unaware) checks
+
+The `GlitchDetector` class looks for purely temporal anomalies without anatomy knowledge:
+
+- **`landmark_jitter`** - Jitter/noise exceeding ordinary motion.
+- **`landmark_jump`** - "Teleportation" of points from one frame to the next.
+- **`detection_flicker`** - Detection toggling on/off rapidly within a short time window.
+- **`pixel_flicker`** - Pixel-level flicker in the face region, a typical sign of a face-swap blending seam.
+
+All thresholds/constants are defined at the top of this file for easy adjustment.
+
+### `detector/physics_checks.py` - Anatomy-aware checks
+
+The `PhysicsChecker` class validates landmark configurations against basic human physical/anatomical constraints:
+
+- **`bone_length`** - Bone (e.g., shoulder-elbow) length consistency over time.
+- **`joint_angle_motion`** - Joint angle change limits (e.g., elbows/knees shouldn't "break").
+- **`head_pose_reprojection`** - Head pose reprojection error (checking the correctness of unwrapping a 3D model onto 2D).
+- **`symmetry_break`** - Left/right symmetry violation.
+
+### `detector/blur_checks.py` - Localized (selective) blur checks
+
+The `BlurChecker` class measures sharpness using the classic variance-of-Laplacian metric and looks for three patterns:
+
+- **`blur_mismatch`** - The face region is sharply blurrier than the background, while the background itself is sharp (i.e. not a general, whole-frame blur).
+- **`hand_blur_anomaly`** - A hand region is blurrier than the face; currently calculated for informational purposes only, with weight = 0 in the score (reason: ordinary depth-of-field effect during gesturing, not a concealment attempt - see the hand landmarks section in README).
+- **`blur_onset_spike`** - A sudden drop in face sharpness compared to its own history (via robust z-score).
+
+This module also accumulates face sharpness samples throughout the video, which are then consumed by `quality_checks.py`.
+
+### `detector/quality_checks.py` - Whole-video bitrate-vs-sharpness
+
+The only check that doesn't operate on a per-frame or short window basis, but instead considers the **entire video as a single data point**:
+
+- Calculates bits-per-pixel (bpp): `file_size_bytes * 8 / (width * height * frame_count)`.
+- Compares it to the median face sharpness of the entire clip.
+- If a video is encoded with high bpp (meaning enough space for data) but the face remains soft/blurry throughout, it's not due to ordinary compression and is flagged as suspicious. This signal is added as an independent additive term to the final score (not in the per-frame noisy-OR) and is capped so it cannot artificially inflate the score on its own.
+
+### `detector/hand_checks.py` - Finger checks (disabled)
+
+Developed and implemented, but **not wired into `main.py`** - kept as a documented, rejected experiment. `finger_bone_length` and `finger_joint_motion` were both tested on real footage: they triggered more often on a video of a real, expressively gesturing person than on a confirmed deepfake - having an inverse effect. This file keeps the logic for future testing, but currently does not affect the score.
+
+### `detector/object_checks.py` - Object anomaly checks
+
+The `ObjectChecker` class acts as an analog to `glitch_detection.py` but for tracked objects instead of people:
+
+- **`object_flicker`** - Detection toggling on/off for an object.
+- **`object_size_jump`** - Sudden change in the bounding box area.
+- **`object_teleport`** - Sudden position change of the center relative to its own size.
+
+All three are computed every frame and appear in the JSON report/annotated video for manual review, but **have weight = 0 in the score** because EfficientDet-Lite0's own detection noise was found to be equally high on real and fake videos (details in the "Object detection" section of the README).
+
+### `detector/scoring.py` - Signal combination into final score
+
+The `AnomalyAggregator` class - the "heart" of the project:
+
+- `combine_signals()` - A shared helper function that aggregates all signals of a single frame (with their respective weights) using a "noisy-OR" weighted sum into a single 0-1 metric.
+- `add_frame()` - Saves the result of each frame and maintains a rolling history for "peak burst" diagnostics.
+- `finalize()` - Aggregates the whole video: 50% average anomaly score + 50% flagged frames fraction = final 0-100 score, plus verdict (`LIKELY REAL`/`SUSPICIOUS`/`LIKELY FAKE`), statistics broken down by category, and the "peak local anomaly burst" informational metric.
+- `DEFAULT_WEIGHTS` - The single source of truth defining the weight of each check in the final score (and which ones have 0, i.e. are currently not trusted by the author).
+
+### `detector/visualizer.py` - Drawing the annotated video
+
+The `draw_overlay()` function draws the output frame: each tracked person's face mesh/pose skeleton/hands in its own color and `P<id>` label, red highlights for points that triggered a rule, tracked object bounding boxes (red if a signal fired on them), and the current score panel. `AnnotatedVideoWriter` wraps `cv2.VideoWriter` to write to a file.
+
+### `detector/report.py` - JSON report and chart
+
+`save_report()` builds the final JSON file (video metadata, final score, category breakdown, flagged frame ranges, downsampled timeline data) and renders the `<report>_timeline.png` chart alongside it using `matplotlib` - showing anomaly score over time.
+
+### `detector/model_utils.py` - Downloading MediaPipe models
+
+A small helper module that downloads and caches the four required MediaPipe model bundles (`face_landmarker.task`, `pose_landmarker_full.task`, `hand_landmarker.task`, `efficientdet_lite0.tflite`) into the `models/` directory on first run - after this, the program works entirely offline.
 
 ## Python სკრიპტების დეტალური აღწერა (ქართულად)
 
