@@ -1,0 +1,10 @@
+{
+  "input_size": 224,
+  "scale": 0.00392156862745098,
+  "mean": [0.485, 0.456, 0.406],
+  "std": [0.229, 0.224, 0.225],
+  "swap_rb": true,
+  "output_type": "softmax",
+  "fake_index": 1,
+  "sample_interval_sec": 0.25
+}

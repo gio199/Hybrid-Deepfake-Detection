@@ -1,0 +1,8 @@
+name,report_path,label,split,group,notes,annotated_path,source_url
+Real webcam baseline,current/real_baseline_report.json,real,test,webcam,Known genuine baseline regenerated with the current detector,,
+James May compilation,current/james_may_report.json,altered,test,face_manipulation,Known face-swap compilation; retained as the face-manipulation subset,,
+Generated flood reporter,current/example2_report.json,generated,test,full_generation,AI-generated reporter clip regenerated with the current detector,,
+Veo 3 street clip,current/veo3_report.json,generated,test,full_generation,Veo 3 multi-person generated clip regenerated with the current detector,,
+AIGVDBench real kitchen,../example4/aigvd_real_kitchen_report.json,real,test,aigvd_real,Prompt-aligned real reference for test item IjW3jibCCmw_16_574to774.mp4,../example4/aigvd_real_kitchen_annotated.mp4,https://huggingface.co/datasets/AIGVDBench/AIGVDBench
+AIGVDBench HunyuanVideo T2V,../example5/aigvd_hunyuanvideo_t2v_kitchen_report.json,generated,test,aigvd_t2v,Text-to-video generation for the prompt-aligned kitchen test item,../example5/aigvd_hunyuanvideo_t2v_kitchen_annotated.mp4,https://huggingface.co/datasets/AIGVDBench/AIGVDBench
+AIGVDBench SVD I2V,../example6/aigvd_svd_i2v_kitchen_report.json,generated,test,aigvd_i2v,Image-to-video generation initialized from the prompt-aligned real test item,../example6/aigvd_svd_i2v_kitchen_annotated.mp4,https://huggingface.co/datasets/AIGVDBench/AIGVDBench

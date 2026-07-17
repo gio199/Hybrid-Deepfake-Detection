@@ -51,6 +51,7 @@ HAND_MAX_VELOCITY_RATIO = 0.12  # skip hands moving faster than this (palm-width
 
 BLUR_SPIKE_Z_THRESHOLD = 3.0   # how far below its own recent baseline sharpness must drop
 BLUR_SPIKE_Z_SATURATE = 7.0
+BLUR_SPIKE_MIN_HISTORY_SEC = 0.20
 
 
 def _clip01(v: float) -> float:
@@ -92,7 +93,7 @@ class BlurChecker:
     """Stateful localized-blur checks; call `analyze()` once per frame."""
 
     def __init__(self, history_window: int = SHARPNESS_HISTORY):
-        self._face_sharpness_history: Deque[float] = deque(maxlen=history_window)
+        self._face_sharpness_history: Deque[Tuple[float, float]] = deque(maxlen=history_window)
         # Unbounded, whole-clip record of normalized (resolution-independent)
         # face sharpness, used only by the video-level blur-vs-bitrate check
         # (see quality_checks.py) after the whole video has been processed.
@@ -115,7 +116,7 @@ class BlurChecker:
         if face_sharpness is None:
             return signals
 
-        self._face_sharpness_history.append(face_sharpness)
+        self._face_sharpness_history.append((fl.timestamp_sec, face_sharpness))
 
         norm_sharpness = normalized_face_sharpness(gray[face_bbox[1]:face_bbox[3], face_bbox[0]:face_bbox[2]])
         if norm_sharpness is not None:
@@ -168,9 +169,10 @@ class BlurChecker:
                       f"Face is selectively blurrier than the rest of the scene (ratio={ratio:.2f}) - "
                       "possible attempt to hide artifacts")
 
-    def _check_blur_spike(self, values: List[float]) -> Optional[Signal]:
-        if len(values) < 6:
+    def _check_blur_spike(self, samples: List[Tuple[float, float]]) -> Optional[Signal]:
+        if len(samples) < 6 or samples[-1][0] - samples[0][0] < BLUR_SPIKE_MIN_HISTORY_SEC:
             return None
+        values = [value for _, value in samples]
         z = LandmarkHistory.robust_zscore_of_last(values)
         if z > -BLUR_SPIKE_Z_THRESHOLD:
             return None

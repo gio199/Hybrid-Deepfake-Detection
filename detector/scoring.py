@@ -1,12 +1,10 @@
-"""Aggregates per-frame glitch/physics anomaly signals into a single
-video-level fake-likelihood score.
+"""Aggregates per-frame glitch/physics evidence into a video anomaly score.
 
-Per frame, the individual category scores (each in [0, 1]) are combined
-with a weighted noisy-OR: independent pieces of weak evidence compound
-towards a high combined score, while a single strong signal (e.g. a
-severe head-pose reprojection failure) can push a frame's score high on
-its own. The final video-level score blends how *anomalous* frames are on
-average with how *often* frames cross the "flagged" threshold.
+Per frame, correlated signals are first collapsed by evidence group, then
+the group maxima are combined with a weighted noisy-OR. This prevents one
+bad landmark estimate from multiplying into several supposedly independent
+pieces of evidence. The final video-level score blends how *anomalous*
+frames are on average with how *often* frames cross the flag threshold.
 """
 
 from __future__ import annotations
@@ -78,7 +76,31 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "object_flicker": 0.0,
     "object_size_jump": 0.0,
     "object_teleport": 0.0,
+    "learned_face": 1.0,
 }
+
+# Signals derived from the same underlying landmarks or pixels are
+# correlated. Combining them independently lets one tracking failure
+# multiply into several pieces of apparent evidence, so take the strongest
+# contribution within a group and only noisy-OR across distinct groups.
+SIGNAL_GROUPS: Dict[str, str] = {
+    "landmark_jitter": "landmark_motion",
+    "landmark_jump": "landmark_motion",
+    "detection_flicker": "detection_reliability",
+    "pixel_flicker": "pixel_temporal",
+    "bone_length": "body_geometry",
+    "joint_angle_motion": "body_geometry",
+    "symmetry_break": "body_geometry",
+    "head_pose_reprojection": "face_geometry",
+    "blur_mismatch": "appearance_quality",
+    "blur_onset_spike": "appearance_quality",
+    "hand_blur_anomaly": "appearance_quality",
+    "object_flicker": "object_reliability",
+    "object_size_jump": "object_reliability",
+    "object_teleport": "object_reliability",
+    "learned_face": "learned_forensics",
+}
+FUSION_METHOD = "grouped-max-noisy-or-v2"
 
 
 def combine_signals(signals: List[Signal], weights: Dict[str, float]) -> float:
@@ -90,10 +112,15 @@ def combine_signals(signals: List[Signal], weights: Dict[str, float]) -> float:
     (ranking which tracked person is "worst" in a multi-person frame) so
     both always agree on how signals combine.
     """
-    survival = 1.0
+    grouped_contributions: Dict[str, float] = {}
     for s in signals:
         weight = weights.get(s.name, 1.0)
         contribution = _clip01(weight * s.score)
+        group = SIGNAL_GROUPS.get(s.name, s.name)
+        grouped_contributions[group] = max(grouped_contributions.get(group, 0.0), contribution)
+
+    survival = 1.0
+    for contribution in grouped_contributions.values():
         survival *= (1.0 - contribution)
     return _clip01(1.0 - survival)
 
@@ -113,10 +140,10 @@ DEFAULT_FRAME_FLAG_THRESHOLD = 0.4
 # `peak_window_score` (see `_peak_window_score`) - an informational
 # diagnostic that does NOT affect the score/verdict, so users can still
 # notice "this clip has a short but severe anomaly cluster" without that
-# fact silently corrupting the calibrated overall likelihood.
+# fact silently corrupting the overall anomaly score.
 MEAN_SCORE_WEIGHT = 0.5
 FRAC_FLAGGED_WEIGHT = 0.5
-PEAK_WINDOW_FRAMES = 15   # ~0.5-1s at typical fps; used only for the informational peak-window stat
+PEAK_WINDOW_SECONDS = 0.75
 
 # `blur_vs_bitrate_mismatch` (see quality_checks.py) is a whole-video statistic,
 # not a per-frame one, so it can't sit in the per-frame noisy-OR combination
@@ -131,10 +158,12 @@ PEAK_WINDOW_FRAMES = 15   # ~0.5-1s at typical fps; used only for the informatio
 # global signal at all, leaving the score identical to before this check
 # existed). Calibrated on only 3 clips at time of writing - see
 # quality_checks.py's module docstring for the numbers.
-GLOBAL_QUALITY_WEIGHT = 0.35
+GLOBAL_QUALITY_WEIGHT = 0.15
 
 VERDICT_LIKELY_FAKE_THRESHOLD = 55.0
 VERDICT_SUSPICIOUS_THRESHOLD = 30.0
+MIN_EVIDENCE_DURATION_SEC = 1.0
+MIN_EVIDENCE_COVERAGE = 0.25
 
 
 def _clip01(v: float) -> float:
@@ -176,6 +205,11 @@ class VideoResult:
     global_quality_reason: str = ""
     max_people_detected: int = 0
     people_track_count: int = 0
+    evidence_coverage: float = 0.0
+    evidence_duration_sec: float = 0.0
+    evidence_warning: str = ""
+    frame_flag_threshold: float = DEFAULT_FRAME_FLAG_THRESHOLD
+    fusion_method: str = FUSION_METHOD
 
 
 class AnomalyAggregator:
@@ -225,6 +259,7 @@ class AnomalyAggregator:
                 frames_total=len(self._frame_scores),
                 max_people_detected=max_people_detected,
                 people_track_count=people_track_count,
+                frame_flag_threshold=self.frame_flag_threshold,
             )
 
         scores = [fs.combined_score for fs in evaluated_scores]
@@ -237,10 +272,29 @@ class AnomalyAggregator:
         final_score = round(100.0 * _clip01(final01), 1)
 
         peak_score, peak_ts = self._peak_window(evaluated_scores)
+        coverage = len(evaluated_scores) / len(self._frame_scores) if self._frame_scores else 0.0
+        frame_deltas = [
+            b.timestamp_sec - a.timestamp_sec
+            for a, b in zip(self._frame_scores, self._frame_scores[1:])
+            if b.timestamp_sec > a.timestamp_sec
+        ]
+        nominal_delta = float(np.median(frame_deltas)) if frame_deltas else 0.0
+        evidence_duration = len(evaluated_scores) * nominal_delta
+        evidence_warnings = []
+        if coverage < MIN_EVIDENCE_COVERAGE:
+            evidence_warnings.append(
+                f"only {coverage * 100:.1f}% of frames contained usable face/body evidence"
+            )
+        if evidence_duration < MIN_EVIDENCE_DURATION_SEC:
+            evidence_warnings.append(
+                f"only {evidence_duration:.2f}s of usable evidence was available"
+            )
+        evidence_warning = "; ".join(evidence_warnings)
+        verdict = "INSUFFICIENT EVIDENCE" if evidence_warning else self._verdict(final_score)
 
         return VideoResult(
             final_score=final_score,
-            verdict=self._verdict(final_score),
+            verdict=verdict,
             category_breakdown=self._category_breakdown(evaluated_scores),
             flagged_ranges=self._flagged_ranges(),
             frame_scores=self._frame_scores,
@@ -252,6 +306,10 @@ class AnomalyAggregator:
             global_quality_reason=global_reason,
             max_people_detected=max_people_detected,
             people_track_count=people_track_count,
+            evidence_coverage=coverage,
+            evidence_duration_sec=evidence_duration,
+            evidence_warning=evidence_warning,
+            frame_flag_threshold=self.frame_flag_threshold,
         )
 
     @staticmethod
@@ -269,16 +327,30 @@ class AnomalyAggregator:
         clip (e.g. a compilation video with one bad cut). Deliberately
         excluded from the main score; see the note above `PEAK_WINDOW_FRAMES`.
         """
-        n = len(evaluated_scores)
-        if n == 0:
+        if not evaluated_scores:
             return 0.0, 0.0
-        window = min(PEAK_WINDOW_FRAMES, n)
-        scores = np.array([fs.combined_score for fs in evaluated_scores])
-        kernel = np.ones(window) / window
-        rolling = np.convolve(scores, kernel, mode="valid")
-        best_idx = int(np.argmax(rolling))
-        center_idx = min(best_idx + window // 2, n - 1)
-        return float(rolling[best_idx]), float(evaluated_scores[center_idx].timestamp_sec)
+
+        left = 0
+        running_sum = 0.0
+        best_score = -1.0
+        best_left = 0
+        best_right = 0
+        for right, frame_score in enumerate(evaluated_scores):
+            running_sum += frame_score.combined_score
+            while (
+                left < right
+                and frame_score.timestamp_sec - evaluated_scores[left].timestamp_sec > PEAK_WINDOW_SECONDS
+            ):
+                running_sum -= evaluated_scores[left].combined_score
+                left += 1
+            window_score = running_sum / (right - left + 1)
+            if window_score > best_score:
+                best_score = window_score
+                best_left, best_right = left, right
+        center_timestamp = (
+            evaluated_scores[best_left].timestamp_sec + evaluated_scores[best_right].timestamp_sec
+        ) / 2.0
+        return float(max(best_score, 0.0)), float(center_timestamp)
 
     def _category_breakdown(self, evaluated_scores: List[FrameScore]) -> Dict[str, Dict[str, float]]:
         breakdown: Dict[str, Dict[str, float]] = {}

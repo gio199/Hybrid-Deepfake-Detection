@@ -39,7 +39,8 @@ from .landmarks import (
 
 # --- Tunable thresholds -------------------------------------------------
 
-MIN_HISTORY_FRAMES = 8
+MIN_HISTORY_FRAMES = 6
+MIN_HISTORY_SECONDS = 0.25
 MIN_POSE_VISIBILITY = 0.5   # ignore pose points that are occluded / out of frame - their positions are unreliable
 
 BONE_LENGTH_Z_THRESHOLD = 3.5
@@ -65,6 +66,10 @@ def _dist(a, b) -> float:
     return float(np.hypot(a.x - b.x, a.y - b.y))
 
 
+def _dist3(a, b) -> float:
+    return float(np.linalg.norm([a.x - b.x, a.y - b.y, a.z - b.z]))
+
+
 def _pose_visible(fl: FrameLandmarks, *idxs: int) -> bool:
     """True only if every given pose landmark is confidently visible.
 
@@ -79,8 +84,8 @@ def _pose_visible(fl: FrameLandmarks, *idxs: int) -> bool:
 
 
 def _angle_deg(a, vertex, b) -> Optional[float]:
-    v1 = np.array([a.x - vertex.x, a.y - vertex.y], dtype=np.float64)
-    v2 = np.array([b.x - vertex.x, b.y - vertex.y], dtype=np.float64)
+    v1 = np.array([a.x - vertex.x, a.y - vertex.y, a.z - vertex.z], dtype=np.float64)
+    v2 = np.array([b.x - vertex.x, b.y - vertex.y, b.z - vertex.z], dtype=np.float64)
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
     if n1 < 1e-6 or n2 < 1e-6:
         return None
@@ -140,12 +145,16 @@ def _compute_frame_metrics(fl: FrameLandmarks) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
 
     if fl.pose_present and fl.pose is not None:
+        # World coordinates greatly reduce perspective/foreshortening
+        # artifacts in bone lengths and joint angles. Fall back to image
+        # coordinates for compatibility with synthetic/unit-test inputs.
+        pose_points = fl.pose_world if fl.pose_world and len(fl.pose_world) == len(fl.pose) else fl.pose
         for name, (a, b) in POSE_BONES.items():
             if _pose_visible(fl, a, b):
-                metrics[f"bone:{name}"] = _dist(fl.pose[a], fl.pose[b])
+                metrics[f"bone:{name}"] = _dist3(pose_points[a], pose_points[b])
         for name, (a, vertex, b) in POSE_JOINT_ANGLES.items():
             if _pose_visible(fl, a, vertex, b):
-                angle = _angle_deg(fl.pose[a], fl.pose[vertex], fl.pose[b])
+                angle = _angle_deg(pose_points[a], pose_points[vertex], pose_points[b])
                 if angle is not None:
                     metrics[f"angle:{name}"] = angle
 
@@ -192,7 +201,10 @@ class PhysicsChecker:
 
     def analyze(self, history: LandmarkHistory) -> List[Signal]:
         frames = history.frames()
-        if len(frames) < MIN_HISTORY_FRAMES:
+        if (
+            len(frames) < MIN_HISTORY_FRAMES
+            or frames[-1].timestamp_sec - frames[0].timestamp_sec < MIN_HISTORY_SECONDS
+        ):
             return []
 
         series = [_compute_frame_metrics(fl) for fl in frames]

@@ -45,10 +45,20 @@ class FrameSource:
         self.width: int = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height: int = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # OpenCV/FFmpeg exposes the video stream bitrate here (kbit/s).
+        # Unlike os.path.getsize(), this excludes most container/audio
+        # overhead and is therefore the preferred input to quality checks.
+        bitrate_property = getattr(cv2, "CAP_PROP_BITRATE", None)
+        raw_bitrate = self._cap.get(bitrate_property) if bitrate_property is not None else 0.0
+        self.video_bitrate_kbps: Optional[float] = (
+            float(raw_bitrate) if not is_webcam and raw_bitrate > 0 else None
+        )
+
         raw_total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.total_frames: Optional[int] = raw_total if (not is_webcam and raw_total > 0) else None
 
         self._frame_idx = 0
+        self._last_timestamp_sec = -1.0
 
     def __enter__(self) -> "FrameSource":
         return self
@@ -67,8 +77,23 @@ class FrameSource:
         if not ok or frame is None:
             raise StopIteration
 
-        timestamp_sec = self._frame_idx / self.fps
+        fallback_timestamp = self._frame_idx / self.fps
+        timestamp_sec = fallback_timestamp
+        if not self.is_webcam:
+            # CAP_PROP_POS_MSEC preserves presentation timestamps for
+            # variable-frame-rate files when the backend exposes them.
+            reported_timestamp = float(self._cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+            if reported_timestamp >= 0.0:
+                timestamp_sec = reported_timestamp
+
+        # Some OpenCV backends report 0 or a stale timestamp. MediaPipe's
+        # VIDEO mode requires strictly increasing timestamps, so fall back
+        # to the nominal FPS clock when necessary.
+        if timestamp_sec <= self._last_timestamp_sec:
+            timestamp_sec = max(fallback_timestamp, self._last_timestamp_sec + 1.0 / self.fps)
+
         info = FrameInfo(index=self._frame_idx, timestamp_sec=timestamp_sec, frame=frame)
+        self._last_timestamp_sec = timestamp_sec
         self._frame_idx += 1
         return info
 

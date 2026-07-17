@@ -1,0 +1,21 @@
+{
+  "samples": 7,
+  "classified_samples": 7,
+  "selective_coverage": 1.0,
+  "threshold": 0.55,
+  "confusion": {
+    "tp": 0,
+    "fp": 1,
+    "tn": 1,
+    "fn": 5
+  },
+  "accuracy": 0.14285714285714285,
+  "precision": 0.0,
+  "recall": 0.0,
+  "specificity": 0.5,
+  "f1": 0.0,
+  "roc_auc": 0.4,
+  "average_precision": 0.6861904761904762,
+  "brier_score": 0.43557614285714286,
+  "expected_calibration_error": 0.5744285714285714
+}

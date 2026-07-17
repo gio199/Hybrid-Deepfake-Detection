@@ -11,10 +11,23 @@ env/
 # Auto-downloaded MediaPipe model bundles (fetched on first run, see README)
 models/
 
+# Runtime caches are constrained to the project instead of the OS temp/profile.
+.runtime_cache/
+
 # Default output artifacts from ad-hoc `python main.py` runs
 output_annotated.mp4
 report.json
 report_timeline.png
+
+# Large local benchmark media/cache. Numeric reports and charts stay trackable.
+benchmarks/current/*.mp4
+benchmarks/cache/
+
+# AIGVDBench media is fetched locally. Keep dataset-controlled inputs and
+# annotated copies out of version control; source metadata remains trackable.
+example4/*.mp4
+example5/*.mp4
+example6/*.mp4
 
 # Editor/OS cruft
 .vscode/

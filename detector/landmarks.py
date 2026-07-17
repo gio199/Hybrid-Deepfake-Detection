@@ -17,6 +17,15 @@ from mediapipe.tasks.python import BaseOptions, vision
 from .model_utils import ensure_model
 
 
+def _visibility_or_default(value: Optional[float]) -> float:
+    """Preserve a valid zero visibility; only missing values default to 1."""
+    return 1.0 if value is None else float(value)
+
+
+def _timestamp_to_ms(timestamp_sec: float) -> int:
+    return int(round(timestamp_sec * 1000.0))
+
+
 # --- Named landmark indices (kept here so other modules share one source of truth) ---
 
 # FaceMesh (refine_landmarks=True -> 478 points: 468 mesh + 10 iris)
@@ -161,6 +170,7 @@ class FrameLandmarks:
     image_h: int
     face: Optional[List[Landmark]] = None
     pose: Optional[List[Landmark]] = None
+    pose_world: Optional[List[Landmark]] = None
     face_present: bool = False
     pose_present: bool = False
     face_detection_score: float = 0.0
@@ -236,6 +246,7 @@ class RawFrameDetections:
     image_h: int
     faces: List[List[Landmark]] = field(default_factory=list)
     poses: List[List[Landmark]] = field(default_factory=list)
+    pose_worlds: List[List[Landmark]] = field(default_factory=list)
     pose_scores: List[float] = field(default_factory=list)
     hands: List[List[Landmark]] = field(default_factory=list)
     handedness: List[str] = field(default_factory=list)
@@ -300,10 +311,10 @@ class MediaPipeExtractor:
         rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # VIDEO running mode only requires a monotonically increasing
-        # integer timestamp per stream; the frame index satisfies that
-        # regardless of the source's real playback fps.
-        timestamp_ms = frame_idx
+        # MediaPipe VIDEO mode requires the frame presentation timestamp in
+        # milliseconds. Passing frame_idx here would make ordinary 30fps
+        # footage look like a 1000fps stream to its temporal tracker.
+        timestamp_ms = _timestamp_to_ms(timestamp_sec)
 
         face_result = self._face_landmarker.detect_for_video(mp_image, timestamp_ms)
         pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
@@ -314,12 +325,30 @@ class MediaPipeExtractor:
         for mesh in face_result.face_landmarks:
             result.faces.append([Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in mesh])
 
-        for pts in pose_result.pose_landmarks:
+        for pose_idx, pts in enumerate(pose_result.pose_landmarks):
             result.poses.append([
-                Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w, visibility=lm.visibility or 1.0) for lm in pts
+                Landmark(
+                    x=lm.x * w,
+                    y=lm.y * h,
+                    z=lm.z * w,
+                    visibility=_visibility_or_default(lm.visibility),
+                )
+                for lm in pts
             ])
-            visibilities = [lm.visibility or 1.0 for lm in pts]
+            visibilities = [_visibility_or_default(lm.visibility) for lm in pts]
             result.pose_scores.append(float(np.mean(visibilities)) if visibilities else 0.0)
+            if pose_idx < len(pose_result.pose_world_landmarks):
+                result.pose_worlds.append([
+                    Landmark(
+                        x=float(lm.x),
+                        y=float(lm.y),
+                        z=float(lm.z),
+                        visibility=_visibility_or_default(lm.visibility),
+                    )
+                    for lm in pose_result.pose_world_landmarks[pose_idx]
+                ])
+            else:
+                result.pose_worlds.append([])
 
         for hand in hand_result.hand_landmarks:
             result.hands.append([Landmark(x=lm.x * w, y=lm.y * h, z=lm.z * w) for lm in hand])

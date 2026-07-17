@@ -8,13 +8,20 @@ import json
 import os
 from typing import Dict, List
 
+# Keep Matplotlib's font/config cache inside the designated project folder.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    os.path.join(_PROJECT_ROOT, ".runtime_cache", "matplotlib"),
+)
+
 import matplotlib
 
 matplotlib.use("Agg")  # headless-safe backend, no GUI/display required
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .scoring import DEFAULT_FRAME_FLAG_THRESHOLD, VideoResult
+from .scoring import VideoResult
 
 MAX_SERIES_POINTS = 2000
 
@@ -45,6 +52,11 @@ def build_report_dict(result: VideoResult, video_meta: Dict) -> Dict:
             "global_quality_reason": result.global_quality_reason,
             "max_people_detected": result.max_people_detected,
             "people_track_count": result.people_track_count,
+            "evidence_coverage": round(result.evidence_coverage, 4),
+            "evidence_duration_sec": round(result.evidence_duration_sec, 2),
+            "evidence_warning": result.evidence_warning,
+            "score_kind": "anomaly_score",
+            "fusion_method": result.fusion_method,
         },
         "category_breakdown": result.category_breakdown,
         "flagged_ranges": [
@@ -101,7 +113,7 @@ def _save_timeline_chart(result: VideoResult, chart_path: str) -> None:
         smoothed = np.convolve(scores, kernel, mode="same")
         ax.plot(timestamps, smoothed, color="#1f77b4", linewidth=1.8, label="Smoothed")
 
-    ax.axhline(DEFAULT_FRAME_FLAG_THRESHOLD * 100, color="gray", linestyle="--", linewidth=0.8,
+    ax.axhline(result.frame_flag_threshold * 100, color="gray", linestyle="--", linewidth=0.8,
                label="Flag threshold")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Anomaly score (0-100)")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CLI entry point for the heuristic deepfake video detector.
+"""CLI entry point for the explainable AI-generated video detector.
 
 Examples:
     python main.py --input clip.mp4 --output out_annotated.mp4 --report report.json
@@ -9,6 +9,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -23,6 +24,7 @@ from detector.capture import FrameSource
 from detector.glitch_detection import GlitchDetector
 from detector.history import LandmarkHistory, Signal
 from detector.landmarks import FrameLandmarks, MediaPipeExtractor
+from detector.learned_detector import LearnedFaceDetector
 from detector.object_checks import ObjectChecker
 from detector.object_detection import ObjectExtractor, ObjectTracker, TrackedObject
 from detector.person_tracker import MultiPersonTracker
@@ -33,7 +35,7 @@ from detector.scoring import AnomalyAggregator, VERDICT_SUSPICIOUS_THRESHOLD, co
 from detector.visualizer import AnnotatedVideoWriter, draw_overlay
 
 ROLLING_DISPLAY_WINDOW = 15
-PERSON_IDLE_DROP_FRAMES = 300   # drop a person's whole pipeline (own history/checkers) after this many missed frames
+PERSON_IDLE_DROP_SECONDS = 10.0
 
 
 @dataclass
@@ -54,8 +56,8 @@ class PersonPipeline:
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Heuristic deepfake detector: tracks facial/body landmarks and flags "
-                    "glitches and physically implausible motion to produce a fake-likelihood score."
+        description="Explainable AI-generated video detector: combines person-centric "
+                    "temporal/physical checks with optional learned forensic evidence."
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--input", type=str, help="Path to an input video file.")
@@ -70,8 +72,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                          help="Don't open a live preview window while processing.")
     parser.add_argument("--no-output-video", action="store_true",
                          help="Skip writing the annotated output video (report only).")
-    parser.add_argument("--history-window", type=int, default=30,
-                         help="Number of past frames kept for jitter/z-score baselines (default: 30).")
+    parser.add_argument("--history-seconds", type=float, default=1.0,
+                         help="Duration of history kept for temporal baselines (default: 1.0 second).")
+    parser.add_argument("--history-window", type=int, default=None,
+                         help="Deprecated frame-count override for history capacity.")
     parser.add_argument("--frame-flag-threshold", type=float, default=None,
                          help="Override the per-frame anomaly threshold (0-1) used for flagging (default: 0.4).")
     parser.add_argument("--max-frames", type=int, default=None,
@@ -85,6 +89,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                               "coverage. Only raise it if your footage actually has multiple people.")
     parser.add_argument("--no-object-detection", action="store_true",
                          help="Disable generic object detection/tracking (faster, person-only analysis).")
+    parser.add_argument("--learned-model", type=str, default=None,
+                         help="Optional ONNX aligned-face forensic classifier.")
+    parser.add_argument("--learned-config", type=str, default=None,
+                         help="Optional JSON preprocessing/output config for --learned-model.")
 
     return parser.parse_args(argv)
 
@@ -92,8 +100,13 @@ def parse_args(argv=None) -> argparse.Namespace:
 def _people_with_scores(tracked_people: List[Tuple[int, FrameLandmarks]],
                          person_pipelines: Dict[int, PersonPipeline],
                          weights: Dict[str, float], history_window: int,
-                         frame_bgr) -> Tuple[List[Tuple[int, FrameLandmarks, Dict[str, float]]],
-                                              Optional[int], List[Signal]]:
+                         frame_bgr,
+                         learned_detector: Optional[LearnedFaceDetector] = None
+                         ) -> Tuple[
+                             List[Tuple[int, FrameLandmarks, Dict[str, float]]],
+                             Optional[int],
+                             List[Signal],
+                         ]:
     """Updates every currently-tracked person's own pipeline and returns
     (per-person display info, id of the worst-scoring person, that
     person's signals) - the "worst person this frame" drives the video's
@@ -107,7 +120,14 @@ def _people_with_scores(tracked_people: List[Tuple[int, FrameLandmarks]],
     for person_id, fl in tracked_people:
         pipeline = person_pipelines.get(person_id)
         if pipeline is None:
-            pipeline = PersonPipeline(history=LandmarkHistory(window=history_window))
+            pipeline = PersonPipeline(
+                history=LandmarkHistory(window=history_window),
+                glitch_detector=GlitchDetector(
+                    flicker_window=max(4, history_window // 3),
+                    pixel_history_window=history_window,
+                ),
+                blur_checker=BlurChecker(history_window=history_window),
+            )
             person_pipelines[person_id] = pipeline
         pipeline.idle_frames = 0
         pipeline.history.push(fl)
@@ -116,6 +136,10 @@ def _people_with_scores(tracked_people: List[Tuple[int, FrameLandmarks]],
         signals.extend(pipeline.glitch_detector.analyze(pipeline.history, frame_bgr))
         signals.extend(pipeline.physics_checker.analyze(pipeline.history))
         signals.extend(pipeline.blur_checker.analyze(pipeline.history, frame_bgr))
+        if learned_detector is not None:
+            learned_signal = learned_detector.analyze(person_id, fl, frame_bgr)
+            if learned_signal is not None:
+                signals.append(learned_signal)
 
         category_scores = {s.name: s.score for s in signals}
         people_display.append((person_id, fl, category_scores))
@@ -131,6 +155,18 @@ def _people_with_scores(tracked_people: List[Tuple[int, FrameLandmarks]],
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.history_seconds <= 0:
+        print("Error: --history-seconds must be greater than zero.", file=sys.stderr)
+        return 2
+    if args.frame_flag_threshold is not None and not 0.0 <= args.frame_flag_threshold <= 1.0:
+        print("Error: --frame-flag-threshold must be between zero and one.", file=sys.stderr)
+        return 2
+    if args.max_people < 1:
+        print("Error: --max-people must be at least one.", file=sys.stderr)
+        return 2
+    if args.max_frames is not None and args.max_frames < 1:
+        print("Error: --max-frames must be at least one.", file=sys.stderr)
+        return 2
 
     is_webcam = args.webcam is not None
     source_arg = args.webcam if is_webcam else args.input
@@ -141,6 +177,23 @@ def main(argv=None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    history_window = args.history_window
+    if history_window is None:
+        history_window = max(30, int(math.ceil(source.fps * args.history_seconds)) + 2)
+    elif history_window < 8:
+        print("Error: --history-window must be at least 8.", file=sys.stderr)
+        source.release()
+        return 2
+
+    learned_detector: Optional[LearnedFaceDetector] = None
+    if args.learned_model is not None:
+        try:
+            learned_detector = LearnedFaceDetector(args.learned_model, args.learned_config)
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            source.release()
+            return 2
+
     show_display = not args.no_display
     write_output_video = not args.no_output_video
 
@@ -149,8 +202,10 @@ def main(argv=None) -> int:
               "Press Ctrl+C to stop and generate the report.")
 
     extractor = MediaPipeExtractor(max_people=args.max_people)
-    person_tracker = MultiPersonTracker()
+    person_tracker = MultiPersonTracker(max_missed_frames=max(1, int(round(source.fps * 0.5))))
     person_pipelines: Dict[int, PersonPipeline] = {}
+    archived_face_sharpness_tracks: List[List[float]] = []
+    person_idle_drop_frames = max(1, int(round(source.fps * PERSON_IDLE_DROP_SECONDS)))
 
     object_extractor: Optional[ObjectExtractor] = None
     object_tracker: Optional[ObjectTracker] = None
@@ -182,7 +237,7 @@ def main(argv=None) -> int:
     frames_processed = 0
     max_people_seen_at_once = 0
     start_time = time.time()
-    window_name = "Deepfake Detector - press 'q' to stop"
+    window_name = "AI-Generated Video Detector - press 'q' to stop"
 
     try:
         for frame_info in source:
@@ -191,16 +246,24 @@ def main(argv=None) -> int:
             max_people_seen_at_once = max(max_people_seen_at_once, len(tracked_people))
 
             people_display, worst_person_id, worst_signals = _people_with_scores(
-                tracked_people, person_pipelines, aggregator.weights, args.history_window, frame_info.frame,
+                tracked_people, person_pipelines, aggregator.weights, history_window, frame_info.frame,
+                learned_detector=learned_detector,
             )
 
             seen_ids = {pid for pid, _ in tracked_people}
             for pid, pipeline in list(person_pipelines.items()):
                 if pid in seen_ids:
                     continue
+                pipeline.glitch_detector.observe_missing()
                 pipeline.idle_frames += 1
-                if pipeline.idle_frames > PERSON_IDLE_DROP_FRAMES:
+                if pipeline.idle_frames > person_idle_drop_frames:
+                    if pipeline.blur_checker.face_sharpness_normalized_all:
+                        archived_face_sharpness_tracks.append(
+                            list(pipeline.blur_checker.face_sharpness_normalized_all)
+                        )
                     del person_pipelines[pid]
+                    if learned_detector is not None:
+                        learned_detector.forget_track(pid)
 
             tracked_objects: List[TrackedObject] = []
             object_signals: List[Signal] = []
@@ -263,10 +326,16 @@ def main(argv=None) -> int:
         # face-sharpness history vs. the shared file-level bitrate), and the
         # worst result across people is what's reported/scored - consistent
         # with "worst tracked person drives the video-level signal".
-        for pipeline in person_pipelines.values():
+        face_sharpness_tracks = archived_face_sharpness_tracks + [
+            pipeline.blur_checker.face_sharpness_normalized_all
+            for pipeline in person_pipelines.values()
+        ]
+        for face_sharpness_samples in face_sharpness_tracks:
             quality_signal = assess_blur_vs_bitrate(
-                pipeline.blur_checker.face_sharpness_normalized_all, file_size_bytes,
+                face_sharpness_samples, file_size_bytes,
                 source.width, source.height, frames_processed,
+                video_bitrate_kbps=source.video_bitrate_kbps,
+                fps=source.fps,
             )
             if quality_signal is not None:
                 global_signals.append(quality_signal)
@@ -287,8 +356,13 @@ def main(argv=None) -> int:
         "duration_sec": round(frames_processed / source.fps, 2) if source.fps else None,
         "processing_time_sec": round(elapsed, 2),
         "file_size_bytes": file_size_bytes,
+        "video_bitrate_kbps": source.video_bitrate_kbps,
+        "history_seconds": args.history_seconds,
+        "history_capacity_frames": history_window,
         "max_people": args.max_people,
         "object_detection_enabled": object_extractor is not None,
+        "learned_model_enabled": learned_detector is not None,
+        "learned_model_path": args.learned_model,
     }
 
     chart_path = save_report(result, video_meta, args.report)
@@ -304,9 +378,13 @@ def _print_summary(result, report_path: str, chart_path: str, writer_path) -> No
         print("=" * 50)
         return
 
-    print(f" Fake-likelihood score: {result.final_score:.1f} / 100")
+    print(f" Anomaly score: {result.final_score:.1f} / 100")
     print(f" Verdict: {result.verdict}")
     print(f" Frames evaluated: {result.frames_evaluated} / {result.frames_total}")
+    print(f" Evidence coverage: {result.evidence_coverage * 100:.1f}% "
+          f"({result.evidence_duration_sec:.2f}s)")
+    if result.evidence_warning:
+        print(f" Evidence warning: {result.evidence_warning}")
     print(f" People tracked: max {result.max_people_detected} at once, {result.people_track_count} distinct total")
     peak_pct = result.peak_window_score * 100.0
     print(f" Peak local anomaly burst: {peak_pct:.1f} / 100 (around t={result.peak_window_timestamp_sec:.1f}s)")

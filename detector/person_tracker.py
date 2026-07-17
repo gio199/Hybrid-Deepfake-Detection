@@ -2,12 +2,11 @@
 poses, 2N hands - no correspondence between them) into a stable set of
 per-person `FrameLandmarks`, tracked across frames.
 
-This is deliberately a simple heuristic tracker (nearest-anchor-point
-greedy matching, no Kalman filter, no learned re-identification/embedding
-model) consistent with the rest of this project: good enough to keep a
-stable identity for a person across ordinary motion and brief occlusion,
+This is deliberately a lightweight tracker (velocity prediction plus
+global Hungarian assignment, without a learned re-identification embedding).
+It keeps stable identities through ordinary motion and brief occlusion
 without pretending to solve full multi-object tracking. Two failure modes
-are accepted as tolerable trade-offs rather than solved outright:
+remain:
 
   - Two people crossing paths very closely can swap IDs. This does not
     create a false "fake" signal by itself - the checks that depend on a
@@ -40,6 +39,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from .landmarks import (
     FrameLandmarks, Landmark, RawFrameDetections,
@@ -58,6 +58,8 @@ HAND_FALLBACK_ASSOC_RATIO = 1.2  # looser fallback: hand vs. any person's anchor
 MATCH_DISTANCE_RATIO = 1.2    # max frame-to-frame anchor movement, as a fraction of the person's own scale, to keep the same id
 MAX_MISSED_FRAMES = 15        # ~0.5s at 30fps - matches the flicker-tolerance window used elsewhere in this project
 DEFAULT_SCALE_PX = 80.0       # fallback scale (px) if neither pose nor face size is available
+VELOCITY_SMOOTHING = 0.65
+INVALID_MATCH_COST = 1e6
 
 
 def _dist_xy(a: Tuple[float, float], b: Tuple[float, float]) -> float:
@@ -95,9 +97,11 @@ def _nms_keep_indices(anchors: List[Tuple[float, float]], scales: List[float], s
     return sorted(kept)
 
 
-def _deduplicate_poses(raw: RawFrameDetections) -> Tuple[List[List[Landmark]], List[float]]:
+def _deduplicate_poses(
+    raw: RawFrameDetections,
+) -> Tuple[List[List[Landmark]], List[List[Landmark]], List[float]]:
     if len(raw.poses) <= 1:
-        return raw.poses, raw.pose_scores
+        return raw.poses, raw.pose_worlds, raw.pose_scores
     anchors, scales, scores = [], [], []
     for i, p in enumerate(raw.poses):
         if len(p) <= POSE_NOSE:
@@ -110,7 +114,8 @@ def _deduplicate_poses(raw: RawFrameDetections) -> Tuple[List[List[Landmark]], L
             scales.append(span if span > 1e-3 else DEFAULT_SCALE_PX)
         scores.append(raw.pose_scores[i] if i < len(raw.pose_scores) else 0.0)
     keep = _nms_keep_indices(anchors, scales, scores, POSE_NMS_RATIO)
-    return [raw.poses[i] for i in keep], [raw.pose_scores[i] for i in keep]
+    worlds = [raw.pose_worlds[i] if i < len(raw.pose_worlds) else [] for i in keep]
+    return [raw.poses[i] for i in keep], worlds, [raw.pose_scores[i] for i in keep]
 
 
 def _deduplicate_faces(raw: RawFrameDetections) -> List[List[Landmark]]:
@@ -138,7 +143,7 @@ def _associate_frame(raw: RawFrameDetections) -> List[_UnlabeledPerson]:
     with no cross-frame identity yet.
     """
     faces = _deduplicate_faces(raw)
-    poses, pose_scores = _deduplicate_poses(raw)
+    poses, pose_worlds, pose_scores = _deduplicate_poses(raw)
     n_faces = len(faces)
     n_poses = len(poses)
 
@@ -183,6 +188,8 @@ def _associate_frame(raw: RawFrameDetections) -> List[_UnlabeledPerson]:
             fl.face_detection_score = 1.0
         if pose_idx is not None:
             fl.pose = poses[pose_idx]
+            if pose_idx < len(pose_worlds) and pose_worlds[pose_idx]:
+                fl.pose_world = pose_worlds[pose_idx]
             fl.pose_present = True
             fl.pose_detection_score = pose_scores[pose_idx] if pose_idx < len(pose_scores) else 0.0
 
@@ -249,12 +256,14 @@ class _Track:
     anchor: Tuple[float, float]
     scale: float
     missed_frames: int = 0
+    velocity: Tuple[float, float] = (0.0, 0.0)
+    last_timestamp_sec: float = 0.0
 
 
 class MultiPersonTracker:
     """Assigns stable integer `person_id`s to the unlabeled per-frame
-    people produced by `_associate_frame`, by greedy nearest-anchor
-    matching against the previous frame's tracks.
+    people produced by `_associate_frame`, using velocity-predicted global
+    assignment against the existing tracks.
     """
 
     def __init__(self, max_missed_frames: int = MAX_MISSED_FRAMES):
@@ -266,32 +275,55 @@ class MultiPersonTracker:
     def update(self, raw: RawFrameDetections) -> List[Tuple[int, FrameLandmarks]]:
         people = _associate_frame(raw)
 
-        candidates = []
-        for track_id, track in self._tracks.items():
-            for person_idx, person in enumerate(people):
-                d = _dist_xy(track.anchor, person.anchor)
-                threshold = MATCH_DISTANCE_RATIO * max(track.scale, person.scale)
-                if d <= threshold:
-                    candidates.append((d, track_id, person_idx))
-        candidates.sort(key=lambda c: c[0])
-
         matched_track_to_person: Dict[int, int] = {}
-        used_tracks: set = set()
         used_people: set = set()
-        for d, track_id, person_idx in candidates:
-            if track_id in used_tracks or person_idx in used_people:
-                continue
-            matched_track_to_person[track_id] = person_idx
-            used_tracks.add(track_id)
-            used_people.add(person_idx)
+        track_ids = list(self._tracks)
+        if track_ids and people:
+            cost_matrix = np.full((len(track_ids), len(people)), INVALID_MATCH_COST, dtype=np.float64)
+            for row, track_id in enumerate(track_ids):
+                track = self._tracks[track_id]
+                elapsed = max(0.0, raw.timestamp_sec - track.last_timestamp_sec)
+                predicted_anchor = (
+                    track.anchor[0] + track.velocity[0] * elapsed,
+                    track.anchor[1] + track.velocity[1] * elapsed,
+                )
+                for column, person in enumerate(people):
+                    distance = _dist_xy(predicted_anchor, person.anchor)
+                    threshold = MATCH_DISTANCE_RATIO * max(track.scale, person.scale)
+                    if distance <= threshold:
+                        scale_penalty = abs(float(np.log(max(person.scale, 1e-3) / max(track.scale, 1e-3))))
+                        cost_matrix[row, column] = distance / max(threshold, 1e-6) + 0.10 * scale_penalty
+
+            rows, columns = linear_sum_assignment(cost_matrix)
+            for row, column in zip(rows, columns):
+                if cost_matrix[row, column] >= INVALID_MATCH_COST:
+                    continue
+                track_id = track_ids[row]
+                person_idx = int(column)
+                matched_track_to_person[track_id] = person_idx
+                used_people.add(person_idx)
 
         results: List[Tuple[int, FrameLandmarks]] = []
 
         for track_id, person_idx in matched_track_to_person.items():
             person = people[person_idx]
-            self._tracks[track_id].anchor = person.anchor
-            self._tracks[track_id].scale = person.scale
-            self._tracks[track_id].missed_frames = 0
+            track = self._tracks[track_id]
+            elapsed = raw.timestamp_sec - track.last_timestamp_sec
+            if elapsed > 1e-6:
+                measured_velocity = (
+                    (person.anchor[0] - track.anchor[0]) / elapsed,
+                    (person.anchor[1] - track.anchor[1]) / elapsed,
+                )
+                track.velocity = (
+                    (1.0 - VELOCITY_SMOOTHING) * track.velocity[0]
+                    + VELOCITY_SMOOTHING * measured_velocity[0],
+                    (1.0 - VELOCITY_SMOOTHING) * track.velocity[1]
+                    + VELOCITY_SMOOTHING * measured_velocity[1],
+                )
+            track.anchor = person.anchor
+            track.scale = person.scale
+            track.missed_frames = 0
+            track.last_timestamp_sec = raw.timestamp_sec
             results.append((track_id, person.landmarks))
 
         for person_idx, person in enumerate(people):
@@ -300,7 +332,12 @@ class MultiPersonTracker:
             new_id = self._next_id
             self._next_id += 1
             self.total_people_seen += 1
-            self._tracks[new_id] = _Track(anchor=person.anchor, scale=person.scale, missed_frames=0)
+            self._tracks[new_id] = _Track(
+                anchor=person.anchor,
+                scale=person.scale,
+                missed_frames=0,
+                last_timestamp_sec=raw.timestamp_sec,
+            )
             results.append((new_id, person.landmarks))
 
         stale_ids = []

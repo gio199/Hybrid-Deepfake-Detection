@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from .history import LandmarkHistory, PointSample, Signal
+from .face_crop import aligned_face_crop
 from .landmarks import (
     FrameLandmarks,
     FACE_NOSE_TIP, FACE_FOREHEAD, FACE_LEFT_CHEEK_EDGE, FACE_RIGHT_CHEEK_EDGE,
@@ -36,8 +37,10 @@ REPRESENTATIVE_POSE_POINTS = [POSE_NOSE, POSE_LEFT_WRIST, POSE_RIGHT_WRIST, POSE
 
 MIN_POSE_VISIBILITY = 0.5        # ignore pose points that are occluded / out of frame
 
-JITTER_MIN_WINDOW = 6            # min frames of history needed before scoring jitter
-JITTER_NORMALIZER = 2.2          # divides raw jitter metric to squash into ~[0,1]
+JITTER_MIN_WINDOW = 6            # min samples of uninterrupted history needed
+JITTER_WINDOW_SECONDS = 1.0      # same physical window regardless of source FPS
+JITTER_MIN_DURATION_SECONDS = 0.20
+JITTER_NORMALIZER = 2.2          # divides normalized path/second into ~[0,1]
 
 JUMP_Z_THRESHOLD = 4.5           # z-score above which a displacement is a "jump"
 JUMP_Z_SATURATE = 10.0           # z-score at which the jump score saturates to 1.0
@@ -78,7 +81,11 @@ def _path_efficiency_jitter(samples: List[PointSample], scale: Optional[float]) 
     if path_length < 1e-6:
         return 0.0
 
-    norm_path_length = path_length / scale
+    duration_sec = samples[-1].timestamp_sec - samples[0].timestamp_sec
+    if duration_sec < JITTER_MIN_DURATION_SECONDS:
+        return 0.0
+
+    norm_path_length = path_length / scale / duration_sec
     efficiency = net_displacement / path_length  # 1.0 = perfectly straight motion
     jitter_raw = norm_path_length * (1.0 - efficiency)
     return _clip01(jitter_raw / JITTER_NORMALIZER)
@@ -87,11 +94,17 @@ def _path_efficiency_jitter(samples: List[PointSample], scale: Optional[float]) 
 class GlitchDetector:
     """Stateful glitch checks; call `analyze()` once per frame, in order."""
 
-    def __init__(self):
-        self._face_presence: Deque[bool] = deque(maxlen=FLICKER_WINDOW)
-        self._pose_presence: Deque[bool] = deque(maxlen=FLICKER_WINDOW)
+    def __init__(self, flicker_window: int = FLICKER_WINDOW, pixel_history_window: int = 30):
+        self._face_presence: Deque[bool] = deque(maxlen=flicker_window)
+        self._pose_presence: Deque[bool] = deque(maxlen=flicker_window)
         self._prev_face_crop: Optional[np.ndarray] = None
-        self._pixel_diff_history: Deque[float] = deque(maxlen=30)
+        self._pixel_diff_history: Deque[float] = deque(maxlen=pixel_history_window)
+
+    def observe_missing(self) -> None:
+        """Record a complete detector dropout for an otherwise-live track."""
+        self._face_presence.append(False)
+        self._pose_presence.append(False)
+        self._prev_face_crop = None
 
     def analyze(self, history: LandmarkHistory, frame_bgr: np.ndarray) -> List[Signal]:
         signals: List[Signal] = []
@@ -122,10 +135,14 @@ class GlitchDetector:
 
         scores = []
         for idx in REPRESENTATIVE_FACE_POINTS:
-            series = history.face_series(idx)
+            series = LandmarkHistory.consecutive_tail(
+                history.face_series(idx), duration_sec=JITTER_WINDOW_SECONDS
+            )
             scores.append(_path_efficiency_jitter(series, face_scale))
         for idx in REPRESENTATIVE_POSE_POINTS:
-            series = _visible_pose_series(history, idx)
+            series = LandmarkHistory.consecutive_tail(
+                _visible_pose_series(history, idx), duration_sec=JITTER_WINDOW_SECONDS
+            )
             scores.append(_path_efficiency_jitter(series, pose_scale))
 
         scores = [s for s in scores if s > 0]
@@ -143,17 +160,17 @@ class GlitchDetector:
         max_z = 0.0
         for idx in REPRESENTATIVE_FACE_POINTS:
             series = history.face_series(idx)
-            if len(series) < 6 or not face_scale:
+            if len(series) < 6 or not face_scale or not LandmarkHistory.latest_pair_is_consecutive(series):
                 continue
-            disps = [d / face_scale for d in LandmarkHistory.displacement_series(series)]
+            disps = [d / face_scale for d in LandmarkHistory.displacement_series(series, as_rate=True)]
             z = LandmarkHistory.zscore_of_last(disps)
             max_z = max(max_z, z)
 
         for idx in REPRESENTATIVE_POSE_POINTS:
             series = _visible_pose_series(history, idx)
-            if len(series) < 6 or not pose_scale:
+            if len(series) < 6 or not pose_scale or not LandmarkHistory.latest_pair_is_consecutive(series):
                 continue
-            disps = [d / pose_scale for d in LandmarkHistory.displacement_series(series)]
+            disps = [d / pose_scale for d in LandmarkHistory.displacement_series(series, as_rate=True)]
             z = LandmarkHistory.zscore_of_last(disps)
             max_z = max(max_z, z)
 
@@ -190,21 +207,19 @@ class GlitchDetector:
             self._prev_face_crop = None
             return None
 
-        xs = [p.x for p in fl.face]
-        ys = [p.y for p in fl.face]
-        x0, x1 = max(int(min(xs)), 0), min(int(max(xs)), frame_bgr.shape[1])
-        y0, y1 = max(int(min(ys)), 0), min(int(max(ys)), frame_bgr.shape[0])
-        if x1 - x0 < 4 or y1 - y0 < 4:
+        crop_bgr = aligned_face_crop(frame_bgr, fl, PIXEL_FLICKER_CROP_SIZE)
+        crop = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) if crop_bgr is not None else None
+        if crop is None:
             return None
 
-        crop = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        crop = cv2.resize(crop, (PIXEL_FLICKER_CROP_SIZE, PIXEL_FLICKER_CROP_SIZE)).astype(np.float32)
+        # Remove global brightness/contrast changes before comparing crops.
+        crop = (crop - float(np.mean(crop))) / max(float(np.std(crop)), 8.0)
 
         if self._prev_face_crop is None:
             self._prev_face_crop = crop
             return None
 
-        mad = float(np.mean(np.abs(crop - self._prev_face_crop))) / 255.0
+        mad = float(np.mean(np.abs(crop - self._prev_face_crop)))
         self._prev_face_crop = crop
         self._pixel_diff_history.append(mad)
 

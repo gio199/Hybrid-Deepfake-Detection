@@ -88,16 +88,32 @@ def bits_per_pixel(file_size_bytes: int, width: int, height: int, frame_count: i
     return (file_size_bytes * 8.0) / (width * height * frame_count)
 
 
+def bits_per_pixel_from_bitrate(video_bitrate_kbps: float, width: int, height: int,
+                                fps: float) -> Optional[float]:
+    """Bits allocated per pixel/frame using the encoded video stream only."""
+    if video_bitrate_kbps <= 0 or width <= 0 or height <= 0 or fps <= 0:
+        return None
+    return (video_bitrate_kbps * 1000.0) / (width * height * fps)
+
+
 def assess_blur_vs_bitrate(face_sharpness_samples: List[float], file_size_bytes: Optional[int],
-                            width: int, height: int, frame_count: int) -> Optional[Signal]:
+                            width: int, height: int, frame_count: int,
+                            video_bitrate_kbps: Optional[float] = None,
+                            fps: Optional[float] = None) -> Optional[Signal]:
     """Returns a `blur_vs_bitrate_mismatch` Signal if this video was given
     a generous bitrate but the subject's face is still soft throughout,
     or None if the check doesn't apply / doesn't fire.
     """
-    if file_size_bytes is None or len(face_sharpness_samples) < MIN_SAMPLES:
+    if len(face_sharpness_samples) < MIN_SAMPLES:
         return None
 
-    bpp = bits_per_pixel(file_size_bytes, width, height, frame_count)
+    bpp = None
+    bitrate_source = "container-size estimate"
+    if video_bitrate_kbps is not None and fps is not None:
+        bpp = bits_per_pixel_from_bitrate(video_bitrate_kbps, width, height, fps)
+        bitrate_source = "video-stream bitrate"
+    if bpp is None and file_size_bytes is not None:
+        bpp = bits_per_pixel(file_size_bytes, width, height, frame_count)
     if bpp is None or bpp < HIGH_BPP_GATE:
         return None  # not enough data allocated to expect real sharpness - not a fair comparison
 
@@ -109,7 +125,8 @@ def assess_blur_vs_bitrate(face_sharpness_samples: List[float], file_size_bytes:
     return Signal(
         "blur_vs_bitrate_mismatch",
         score,
-        f"Video was encoded with a generous bitrate ({bpp:.3f} bits/pixel) yet the face stays soft "
+        f"Video was encoded with a generous bitrate ({bpp:.3f} bits/pixel from {bitrate_source}) "
+        f"yet the face stays soft "
         f"throughout the clip (median sharpness={median_sharpness:.0f}) - real camera footage encoded "
         "this generously would normally retain fine detail",
     )

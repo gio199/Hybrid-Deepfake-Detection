@@ -1,7 +1,7 @@
-"""Heuristic deepfake video detector package.
+"""Hybrid explainable AI-generated video detector package.
 
-Rule-based pipeline: MediaPipe landmark extraction -> temporal glitch
-checks + physical plausibility checks -> aggregated likelihood score.
+MediaPipe landmark extraction -> temporal/physical plausibility checks ->
+optional learned face-manipulation evidence -> grouped anomaly score.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

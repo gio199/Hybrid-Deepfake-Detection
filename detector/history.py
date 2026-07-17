@@ -17,6 +17,7 @@ from .landmarks import FrameLandmarks, POSE_LEFT_SHOULDER, POSE_RIGHT_SHOULDER
 @dataclass
 class PointSample:
     frame_idx: int
+    timestamp_sec: float
     x: float
     y: float
     z: float
@@ -88,7 +89,7 @@ class LandmarkHistory:
         for fl in self._buffer:
             if fl.face_present and fl.face is not None:
                 p = fl.face[idx]
-                samples.append(PointSample(fl.frame_idx, p.x, p.y, p.z))
+                samples.append(PointSample(fl.frame_idx, fl.timestamp_sec, p.x, p.y, p.z))
         return samples
 
     def pose_series(self, idx: int) -> List[PointSample]:
@@ -96,7 +97,7 @@ class LandmarkHistory:
         for fl in self._buffer:
             if fl.pose_present and fl.pose is not None:
                 p = fl.pose[idx]
-                samples.append(PointSample(fl.frame_idx, p.x, p.y, p.z, p.visibility))
+                samples.append(PointSample(fl.frame_idx, fl.timestamp_sec, p.x, p.y, p.z, p.visibility))
         return samples
 
     # --- generic stats -------------------------------------------------
@@ -119,7 +120,13 @@ class LandmarkHistory:
         mean = float(np.mean(baseline))
         std = float(np.std(baseline))
         if std < 1e-6:
-            return 0.0
+            # A flat baseline followed by a meaningful change is maximally
+            # surprising, not evidence-free. Preserve the sign so callers
+            # that only care about upward/downward deviations still work.
+            delta = float(last - mean)
+            if abs(delta) < 1e-9:
+                return 0.0
+            return float(np.copysign(np.inf, delta))
         return float((last - mean) / std)
 
     @staticmethod
@@ -136,13 +143,54 @@ class LandmarkHistory:
         median = float(np.median(baseline))
         mad = float(np.median(np.abs(baseline - median)))
         if mad < 1e-9:
-            return 0.0
+            delta = float(last - median)
+            if abs(delta) < 1e-9:
+                return 0.0
+            return float(np.copysign(np.inf, delta))
         return float(0.6745 * (last - median) / mad)
 
     @staticmethod
-    def displacement_series(samples: List[PointSample]) -> List[float]:
-        """Frame-to-frame pixel displacement for a series of consecutive samples."""
+    def displacement_series(samples: List[PointSample], as_rate: bool = False) -> List[float]:
+        """Displacement for consecutive samples.
+
+        Detection gaps are deliberately excluded: treating a person
+        reacquired after several missing frames as a one-frame teleport
+        creates false positives. When ``as_rate`` is true, values are in
+        pixels/second so motion statistics remain comparable across FPS.
+        """
         disps = []
         for prev, cur in zip(samples, samples[1:]):
-            disps.append(LandmarkHistory.displacement(prev, cur))
+            if cur.frame_idx != prev.frame_idx + 1:
+                continue
+            elapsed = cur.timestamp_sec - prev.timestamp_sec
+            if elapsed <= 1e-6:
+                continue
+            displacement = LandmarkHistory.displacement(prev, cur)
+            disps.append(displacement / elapsed if as_rate else displacement)
         return disps
+
+    @staticmethod
+    def latest_pair_is_consecutive(samples: List[PointSample]) -> bool:
+        if len(samples) < 2:
+            return False
+        prev, cur = samples[-2], samples[-1]
+        return cur.frame_idx == prev.frame_idx + 1 and cur.timestamp_sec > prev.timestamp_sec
+
+    @staticmethod
+    def consecutive_tail(samples: List[PointSample], duration_sec: Optional[float] = None) -> List[PointSample]:
+        """Return the most recent uninterrupted run of samples.
+
+        This prevents motion paths from bridging detector dropouts. A
+        duration limit keeps temporal checks expressed in seconds rather
+        than an FPS-dependent number of frames.
+        """
+        if not samples:
+            return []
+        start = len(samples) - 1
+        while start > 0 and samples[start].frame_idx == samples[start - 1].frame_idx + 1:
+            start -= 1
+        tail = samples[start:]
+        if duration_sec is None:
+            return tail
+        cutoff = tail[-1].timestamp_sec - duration_sec
+        return [sample for sample in tail if sample.timestamp_sec >= cutoff]

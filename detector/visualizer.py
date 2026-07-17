@@ -1,5 +1,5 @@
 """Draws face mesh / pose skeleton overlays plus anomaly highlights and a
-running fake-likelihood score panel, and writes the annotated video.
+running anomaly-score panel, and writes the annotated video.
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ def _draw_score_panel(frame: np.ndarray, category_scores: Dict[str, float], comb
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, dst=frame)
 
     header_color = _score_color(rolling_score)
-    cv2.putText(frame, f"Fake likelihood (rolling): {rolling_score * 100:4.1f}%", (18, 30),
+    cv2.putText(frame, f"Anomaly score (rolling): {rolling_score * 100:4.1f}%", (18, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, header_color, 2, cv2.LINE_AA)
     cv2.putText(frame, f"People tracked: {people_count}", (18, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
